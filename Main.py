@@ -5,16 +5,16 @@ import numpy as np
 import numbers
 
 # ==============================================================================
-# 1. KONFIGURATION & SETUP
+# 1. KONFIGURATION
 # ==============================================================================
 
 st.set_page_config(
-    page_title="KPAX Screener V20.1",
+    page_title="KPAX Screener V20.2",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("KPAX Screener V20.1")
+st.title("KPAX Screener V20.2")
 
 DEFAULT_TICKERS = [
     "SMO", "BMW.DE", "MAIR", "GOOGL", "IFX.DE", "1810.HK", "PEP", "KO",
@@ -30,7 +30,8 @@ DEFAULT_TICKERS = [
 # ==============================================================================
 
 def is_valid_number(value):
-    """Prüft zuverlässig, ob ein Wert eine verwendbare Zahl ist."""
+    """Prüft, ob ein Wert eine gültige Zahl ist."""
+
     return (
         isinstance(value, numbers.Number)
         and not isinstance(value, bool)
@@ -38,24 +39,54 @@ def is_valid_number(value):
     )
 
 
-def score_with_minimum(score):
+def minimum_score(score):
     """
-    Real berechnete Scores werden auf mindestens 5 Punkte begrenzt.
+    Echter Score:
+        0 -> 5
+        10 -> 10
+        ...
+        100 -> 100
+
     NaN bleibt NaN = Daten fehlen.
     """
+
     if pd.isna(score):
         return np.nan
 
     return max(5.0, float(score))
 
 
+def safe_float(value):
+    """Konvertiert Zahlen robust nach float."""
+
+    if value is None:
+        return np.nan
+
+    try:
+        value = float(value)
+
+        if np.isfinite(value):
+            return value
+
+    except Exception:
+        pass
+
+    return np.nan
+
+
+# ==============================================================================
+# 3. RSI
+# ==============================================================================
+
 def calc_rsi(prices, period=14):
-    """Berechnet RSI(14)."""
 
     if prices is None or len(prices) < period + 1:
         return np.nan
 
-    prices = pd.to_numeric(prices, errors="coerce").dropna()
+    prices = pd.to_numeric(
+        prices,
+        errors="coerce"
+    ).dropna()
 
     if len(prices) < period + 1:
         return np.nan
@@ -65,19 +96,25 @@ def calc_rsi(prices, period=14):
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
 
-    if avg_loss.iloc[-1] == 0:
+    last_gain = avg_gain.iloc[-1]
+    last_loss = avg_loss.iloc[-1]
+
+    if pd.isna(last_gain) or pd.isna(last_loss):
+        return np.nan
+
+    if last_loss == 0:
         return 100.0
 
-    rs = avg_gain.iloc[-1] / avg_loss.iloc[-1]
+    rs = last_gain / last_loss
 
     return 100 - (100 / (1 + rs))
 
 
 # ==============================================================================
-# 3. EINZELSCORES
+# 4. EINZELSCORES
 # ==============================================================================
 
 def calculate_individual_scores(info, hist):
@@ -85,95 +122,124 @@ def calculate_individual_scores(info, hist):
     if not isinstance(info, dict):
         info = {}
 
-    # --------------------------------------------------------------------------
-    # 1. VALUATION
-    # --------------------------------------------------------------------------
+    # ==========================================================================
+    # VALUATION
+    # ==========================================================================
 
-    pe = info.get("trailingPE")
-    peg = info.get("pegRatio")
+    pe = safe_float(info.get("trailingPE"))
+    peg = safe_float(info.get("pegRatio"))
 
-    val_points = []
+    valuation_points = []
 
     # PEG
-    if is_valid_number(peg) and peg > 0:
+    if not pd.isna(peg) and peg > 0:
 
         if peg < 1.0:
-            val_points.append(100)
+            valuation_points.append(100)
+
         elif peg <= 1.5:
-            val_points.append(60)
+            valuation_points.append(60)
+
         elif peg <= 2.0:
-            val_points.append(30)
+            valuation_points.append(30)
+
         else:
-            val_points.append(0)
+            valuation_points.append(0)
 
     # KGV
-    if is_valid_number(pe) and pe > 0:
+    if not pd.isna(pe) and pe > 0:
 
         if pe < 15:
-            val_points.append(100)
-        elif pe <= 25:
-            val_points.append(60)
-        elif pe <= 35:
-            val_points.append(30)
-        else:
-            val_points.append(0)
+            valuation_points.append(100)
 
-    if val_points:
-        valuation_score = score_with_minimum(np.mean(val_points))
+        elif pe <= 25:
+            valuation_points.append(60)
+
+        elif pe <= 35:
+            valuation_points.append(30)
+
+        else:
+            valuation_points.append(0)
+
+    if valuation_points:
+        valuation_score = minimum_score(
+            np.mean(valuation_points)
+        )
     else:
         valuation_score = np.nan
 
 
-    # --------------------------------------------------------------------------
-    # 2. GROWTH
-    # --------------------------------------------------------------------------
+    # ==========================================================================
+    # GROWTH
+    # ==========================================================================
 
-    earnings_growth = info.get("earningsGrowth")
-    revenue_growth = info.get("revenueGrowth")
+    earnings_growth = safe_float(
+        info.get("earningsGrowth")
+    )
+
+    revenue_growth = safe_float(
+        info.get("revenueGrowth")
+    )
 
     growth_points = []
 
-    if is_valid_number(earnings_growth):
+    # EPS-Wachstum
+    if not pd.isna(earnings_growth):
 
         if earnings_growth > 0.20:
             growth_points.append(100)
+
         elif earnings_growth > 0.10:
             growth_points.append(70)
+
         elif earnings_growth > 0:
             growth_points.append(40)
+
         else:
             growth_points.append(0)
 
-    if is_valid_number(revenue_growth):
+    # Umsatzwachstum
+    if not pd.isna(revenue_growth):
 
         if revenue_growth > 0.15:
             growth_points.append(100)
+
         elif revenue_growth > 0.05:
             growth_points.append(60)
+
         elif revenue_growth > 0:
             growth_points.append(30)
+
         else:
             growth_points.append(0)
 
     if growth_points:
-        growth_score = score_with_minimum(np.mean(growth_points))
+        growth_score = minimum_score(
+            np.mean(growth_points)
+        )
     else:
         growth_score = np.nan
 
 
-    # --------------------------------------------------------------------------
-    # 3. FINANCIAL HEALTH
-    # --------------------------------------------------------------------------
+    # ==========================================================================
+    # FINANCIAL HEALTH
+    # ==========================================================================
 
-    debt_to_equity = info.get("debtToEquity")
-    current_ratio = info.get("currentRatio")
+    debt_to_equity = safe_float(
+        info.get("debtToEquity")
+    )
+
+    current_ratio = safe_float(
+        info.get("currentRatio")
+    )
 
     health_points = []
 
-    if is_valid_number(debt_to_equity):
+    # Debt / Equity
+    if not pd.isna(debt_to_equity):
 
         # Yahoo liefert D/E meistens als Prozentwert.
-        # Beispiel: 80 = 80% = 0.8
+        # 80 = 80 % = 0.8
         de_ratio = (
             debt_to_equity / 100
             if debt_to_equity > 10
@@ -182,29 +248,36 @@ def calculate_individual_scores(info, hist):
 
         if de_ratio < 0.5:
             health_points.append(100)
+
         elif de_ratio <= 1.5:
             health_points.append(60)
+
         else:
             health_points.append(10)
 
-    if is_valid_number(current_ratio):
+    # Current Ratio
+    if not pd.isna(current_ratio):
 
         if current_ratio > 1.5:
             health_points.append(100)
+
         elif current_ratio >= 1.0:
             health_points.append(50)
+
         else:
             health_points.append(0)
 
     if health_points:
-        health_score = score_with_minimum(np.mean(health_points))
+        health_score = minimum_score(
+            np.mean(health_points)
+        )
     else:
         health_score = np.nan
 
 
-    # --------------------------------------------------------------------------
-    # 4. MOMENTUM / TECHNIK
-    # --------------------------------------------------------------------------
+    # ==========================================================================
+    # MOMENTUM / TECHNIK
+    # ==========================================================================
 
     tech_points = []
 
@@ -219,21 +292,26 @@ def calculate_individual_scores(info, hist):
 
             current_price = close_prices.iloc[-1]
 
-            # GD200, falls weniger Daten vorhanden sind automatisch
-            # über vorhandenen Zeitraum berechnen.
-            window = min(200, len(close_prices))
+            # GD200 bzw. längstmöglicher Durchschnitt
+            window = min(
+                200,
+                len(close_prices)
+            )
 
             sma = (
                 close_prices
-                .rolling(window=window)
+                .rolling(window)
                 .mean()
                 .iloc[-1]
             )
 
-            rsi = calc_rsi(close_prices)
+            rsi = calc_rsi(
+                close_prices,
+                14
+            )
 
             # Kurs vs. GD
-            if is_valid_number(sma):
+            if not pd.isna(sma):
 
                 if current_price > sma:
                     tech_points.append(100)
@@ -241,7 +319,7 @@ def calculate_individual_scores(info, hist):
                     tech_points.append(20)
 
             # RSI
-            if is_valid_number(rsi):
+            if not pd.isna(rsi):
 
                 if 40 <= rsi <= 60:
                     tech_points.append(100)
@@ -253,7 +331,9 @@ def calculate_individual_scores(info, hist):
                     tech_points.append(20)
 
     if tech_points:
-        momentum_score = score_with_minimum(np.mean(tech_points))
+        momentum_score = minimum_score(
+            np.mean(tech_points)
+        )
     else:
         momentum_score = np.nan
 
@@ -267,7 +347,7 @@ def calculate_individual_scores(info, hist):
 
 
 # ==============================================================================
-# 4. YAHOO DATEN ABRUFEN
+# 5. DATENABRUF
 # ==============================================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -275,15 +355,15 @@ def fetch_screener_data(tickers):
 
     tickers = list(dict.fromkeys(tickers))
 
-    if not tickers:
-        return pd.DataFrame(), []
-
     data = []
     errors = []
 
-    # --------------------------------------------------------------------------
-    # KURSDATEN IN EINEM EINZIGEN DOWNLOAD
-    # --------------------------------------------------------------------------
+    if not tickers:
+        return pd.DataFrame(), []
+
+    # ==========================================================================
+    # KURSDATEN
+    # ==========================================================================
 
     try:
 
@@ -300,21 +380,21 @@ def fetch_screener_data(tickers):
     except Exception as e:
 
         return pd.DataFrame(), [
-            f"Fehler beim Yahoo-Kursabruf: {str(e)}"
+            f"Kursabruf fehlgeschlagen: {e}"
         ]
 
 
-    # --------------------------------------------------------------------------
-    # EINZELNE AKTIEN VERARBEITEN
-    # --------------------------------------------------------------------------
+    # ==========================================================================
+    # EINZELNE TICKER
+    # ==========================================================================
 
-    for idx, symbol in enumerate(tickers):
+    for symbol in tickers:
 
         try:
 
-            # --------------------------------------------------------------
-            # HISTORIE EXTRAHIEREN
-            # --------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # HISTORIE
+            # ------------------------------------------------------------------
 
             if len(tickers) == 1:
 
@@ -324,120 +404,178 @@ def fetch_screener_data(tickers):
 
                 try:
                     hist = hist_all[symbol].copy()
+
                 except Exception:
                     hist = pd.DataFrame()
 
             if hist.empty or "Close" not in hist.columns:
 
-                errors.append(f"{symbol}: keine Kursdaten")
+                errors.append(
+                    f"{symbol}: keine Kursdaten"
+                )
+
                 continue
 
-
-            hist = hist.dropna(subset=["Close"])
+            hist = hist.dropna(
+                subset=["Close"]
+            )
 
             if hist.empty:
 
-                errors.append(f"{symbol}: keine gültigen Schlusskurse")
+                errors.append(
+                    f"{symbol}: leere Kursdaten"
+                )
+
                 continue
 
 
-            # --------------------------------------------------------------
-            # FUNDAMENTALDATEN
-            # --------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # KURS
+            # ------------------------------------------------------------------
+
+            current_price = safe_float(
+                hist["Close"].iloc[-1]
+            )
+
+
+            # ------------------------------------------------------------------
+            # YAHOO TICKER
+            # ------------------------------------------------------------------
 
             ticker = yf.Ticker(symbol)
+
+
+            # ------------------------------------------------------------------
+            # INFO
+            # ------------------------------------------------------------------
 
             info = {}
 
             try:
+
                 info = ticker.get_info()
 
                 if not isinstance(info, dict):
                     info = {}
 
-            except Exception as e:
-
-                errors.append(
-                    f"{symbol}: Fundamentaldaten nicht verfügbar"
-                )
+            except Exception:
 
                 info = {}
 
 
-            # --------------------------------------------------------------
-            # KURS
-            # --------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # FALLBACK: FAST INFO
+            # ------------------------------------------------------------------
 
-            current_price = np.nan
+            fast_info = {}
 
             try:
 
-                current_price = hist["Close"].iloc[-1]
-
-                if isinstance(current_price, pd.Series):
-                    current_price = current_price.iloc[-1]
+                fast_info = dict(
+                    ticker.fast_info
+                )
 
             except Exception:
-                pass
+
+                fast_info = {}
 
 
-            if not is_valid_number(current_price):
+            # ------------------------------------------------------------------
+            # FUNDAMENTALDATEN
+            # ------------------------------------------------------------------
 
-                try:
-                    current_price = info.get("currentPrice")
-                except Exception:
-                    current_price = np.nan
+            pe = safe_float(
+                info.get("trailingPE")
+            )
+
+            peg = safe_float(
+                info.get("pegRatio")
+            )
+
+            earnings_growth = safe_float(
+                info.get("earningsGrowth")
+            )
+
+            revenue_growth = safe_float(
+                info.get("revenueGrowth")
+            )
+
+            debt_to_equity = safe_float(
+                info.get("debtToEquity")
+            )
+
+            current_ratio = safe_float(
+                info.get("currentRatio")
+            )
+
+            div_yield = safe_float(
+                info.get("dividendYield")
+            )
 
 
-            # --------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # DIVIDENDENRENDITE
+            # ------------------------------------------------------------------
+
+            if not pd.isna(div_yield):
+
+                if div_yield < 1:
+                    div_yield *= 100
+
+
+            # ------------------------------------------------------------------
             # SCORES
-            # --------------------------------------------------------------
+            # ------------------------------------------------------------------
 
             scores = calculate_individual_scores(
-                info,
+
+                {
+                    "trailingPE": pe,
+                    "pegRatio": peg,
+                    "earningsGrowth": earnings_growth,
+                    "revenueGrowth": revenue_growth,
+                    "debtToEquity": debt_to_equity,
+                    "currentRatio": current_ratio
+                },
+
                 hist
             )
 
 
-            # --------------------------------------------------------------
-            # KENNZAHLEN
-            # --------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # NAME
+            # ------------------------------------------------------------------
 
-            pe = info.get("trailingPE", np.nan)
-            peg = info.get("pegRatio", np.nan)
-
-            div_yield = info.get(
-                "dividendYield",
-                np.nan
+            name = info.get(
+                "shortName",
+                info.get(
+                    "longName",
+                    symbol
+                )
             )
 
-            if is_valid_number(div_yield):
 
-                # Yahoo liefert Dividend Yield normalerweise als Dezimalzahl
-                if div_yield < 1:
-                    div_yield *= 100
+            # ------------------------------------------------------------------
+            # SEKTOR
+            # ------------------------------------------------------------------
 
-            else:
-                div_yield = np.nan
+            sector = info.get(
+                "sector",
+                "N/A"
+            )
 
 
-            # --------------------------------------------------------------
-            # DATENSATZ
-            # --------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # DATENZEILE
+            # ------------------------------------------------------------------
 
             data.append({
 
                 "Symbol": symbol,
 
-                "Name": info.get(
-                    "shortName",
-                    symbol
-                ),
+                "Name": name,
 
-                "Sektor": info.get(
-                    "sector",
-                    "N/A"
-                ),
+                "Sektor": sector,
 
                 "Kurs": current_price,
 
@@ -460,17 +598,15 @@ def fetch_screener_data(tickers):
         except Exception as e:
 
             errors.append(
-                f"{symbol}: {type(e).__name__}: {str(e)}"
+                f"{symbol}: {type(e).__name__}: {e}"
             )
-
-            continue
 
 
     return pd.DataFrame(data), errors
 
 
 # ==============================================================================
-# 5. SIDEBAR
+# 6. SIDEBAR
 # ==============================================================================
 
 st.sidebar.header("⚙️ Einstellungen")
@@ -489,7 +625,7 @@ active_tickers = [
 
 
 # ==============================================================================
-# 6. GEWICHTUNG
+# 7. GEWICHTUNG
 # ==============================================================================
 
 st.sidebar.subheader("⚖️ Score-Gewichtung")
@@ -527,7 +663,16 @@ w_mom = st.sidebar.slider(
 )
 
 
-total_w = w_val + w_gro + w_hea + w_mom
+# ==============================================================================
+# 8. GEWICHTE NORMALISIEREN
+# ==============================================================================
+
+total_w = (
+    w_val +
+    w_gro +
+    w_hea +
+    w_mom
+)
 
 if total_w > 0:
 
@@ -545,7 +690,7 @@ else:
 
 
 # ==============================================================================
-# 7. DATEN LADEN
+# 9. DATEN LADEN
 # ==============================================================================
 
 with st.spinner("📡 Lade Yahoo-Finance-Daten..."):
@@ -556,14 +701,13 @@ with st.spinner("📡 Lade Yahoo-Finance-Daten..."):
 
 
 # ==============================================================================
-# 8. FEHLER / DIAGNOSE
+# 10. DIAGNOSE
 # ==============================================================================
 
 if errors:
 
     with st.expander(
-        f"⚠️ Datenhinweise ({len(errors)})",
-        expanded=False
+        f"⚠️ Datenhinweise ({len(errors)})"
     ):
 
         for error in errors:
@@ -571,53 +715,37 @@ if errors:
 
 
 # ==============================================================================
-# 9. GESAMTSCORE
+# 11. SCORE BERECHNEN
 # ==============================================================================
 
 if not df.empty:
 
     def compute_total_score(row):
 
-        score_weight_pairs = [
-
-            (
-                row["Bewertung"],
-                w_val_n
-            ),
-
-            (
-                row["Wachstum"],
-                w_gro_n
-            ),
-
-            (
-                row["Gesundheit"],
-                w_hea_n
-            ),
-
-            (
-                row["Momentum"],
-                w_mom_n
-            )
+        values = [
+            (row["Bewertung"], w_val_n),
+            (row["Wachstum"], w_gro_n),
+            (row["Gesundheit"], w_hea_n),
+            (row["Momentum"], w_mom_n)
         ]
 
-        valid_scores = [
+        valid = [
             (score, weight)
-            for score, weight in score_weight_pairs
+            for score, weight in values
             if pd.notna(score) and weight > 0
         ]
 
-        if not valid_scores:
+        if not valid:
             return np.nan
 
         scores = [
-            x[0]
-            for x in valid_scores
+            item[0]
+            for item in valid
         ]
 
         weights = [
-            x[1]
-            for x in valid_scores
+            item[1]
+            for item in valid
         ]
 
         return np.average(
@@ -632,14 +760,14 @@ if not df.empty:
     )
 
 
-    # --------------------------------------------------------------------------
+    # ==========================================================================
     # SORTIEREN
-    # --------------------------------------------------------------------------
+    # ==========================================================================
 
     df = (
         df
         .sort_values(
-            by="Gesamtscore",
+            "Gesamtscore",
             ascending=False,
             na_position="last"
         )
@@ -647,42 +775,42 @@ if not df.empty:
     )
 
 
-    # ==============================================================================
-    # 10. TABELLE
-    # ==============================================================================
+    # ==========================================================================
+    # TABELLE
+    # ==========================================================================
 
-    st.subheader("📋 Aktienübersicht & Scoring")
+    st.subheader(
+        "📋 Aktienübersicht & Scoring"
+    )
 
     st.dataframe(
 
-        df.style.format({
+        df.style.format(
 
-            "Kurs": "{:.2f}",
+            {
+                "Kurs": "{:.2f}",
+                "KGV (P/E)": "{:.2f}",
+                "PEG": "{:.2f}",
+                "Div. Rendite (%)": "{:.2f} %",
+                "Bewertung": "{:.1f}",
+                "Wachstum": "{:.1f}",
+                "Gesundheit": "{:.1f}",
+                "Momentum": "{:.1f}",
+                "Gesamtscore": "{:.1f}"
+            },
 
-            "KGV (P/E)": "{:.2f}",
+            na_rep="—"
 
-            "PEG": "{:.2f}",
+        ).background_gradient(
 
-            "Div. Rendite (%)": "{:.2f} %",
-
-            "Bewertung": "{:.1f}",
-
-            "Wachstum": "{:.1f}",
-
-            "Gesundheit": "{:.1f}",
-
-            "Momentum": "{:.1f}",
-
-            "Gesamtscore": "{:.1f}"
-        },
-
-        na_rep="—")
-
-        .background_gradient(
             subset=["Gesamtscore"],
+
             cmap="RdYlGn",
+
             vmin=0,
+
             vmax=100
+
         ),
 
         use_container_width=True,
@@ -691,36 +819,49 @@ if not df.empty:
     )
 
 
-    # ==============================================================================
-    # 11. DATENQUALITÄT
-    # ==============================================================================
+    # ==========================================================================
+    # DATENQUALITÄT
+    # ==========================================================================
 
     st.subheader("🔎 Datenqualität")
 
-    quality_cols = [
+    quality = []
+
+    for col in [
+        "KGV (P/E)",
+        "PEG",
         "Bewertung",
         "Wachstum",
         "Gesundheit",
         "Momentum"
-    ]
+    ]:
 
-    df_quality = pd.DataFrame({
+        available = int(
+            df[col].notna().sum()
+        )
 
-        "Score": quality_cols,
+        missing = int(
+            df[col].isna().sum()
+        )
 
-        "Vorhanden": [
-            int(df[c].notna().sum())
-            for c in quality_cols
-        ],
+        quality.append({
 
-        "Fehlend": [
-            int(df[c].isna().sum())
-            for c in quality_cols
-        ]
-    })
+            "Kennzahl": col,
+
+            "Daten vorhanden": available,
+
+            "Daten fehlen": missing,
+
+            "Abdeckung": (
+                f"{available / len(df) * 100:.0f}%"
+                if len(df) > 0
+                else "0%"
+            )
+        })
+
 
     st.dataframe(
-        df_quality,
+        pd.DataFrame(quality),
         hide_index=True,
         use_container_width=True
     )
@@ -729,15 +870,8 @@ if not df.empty:
 else:
 
     st.error(
-        "❌ Es konnten keine verwertbaren Kursdaten geladen werden."
+        "❌ Es konnten keine Aktienkursdaten geladen werden."
     )
-
-    if errors:
-
-        st.write("Letzte Fehlermeldungen:")
-
-        for error in errors[:20]:
-            st.write("•", error)
 
 
 # ==============================================================================
@@ -756,104 +890,104 @@ col1, col2 = st.columns(2)
 with col1:
 
     st.markdown(
-        "### 📊 Einzelscores (5 bis 100 Punkte)"
+        "### 📊 Einzelscores (5–100 Punkte)"
     )
 
     st.markdown("""
-    **Bewertungs-Score (Valuation)**
+**Bewertung (Valuation)**
 
-    * PEG < 1,0 → 100 Punkte
-    * PEG 1,0–1,5 → 60 Punkte
-    * PEG 1,5–2,0 → 30 Punkte
-    * PEG > 2,0 → 0 → **5 Punkte Mindestwert**
-    * KGV < 15 → 100 Punkte
-    * KGV 15–25 → 60 Punkte
-    * KGV 25–35 → 30 Punkte
-    * KGV > 35 → 0 → **5 Punkte Mindestwert**
+* PEG < 1,0 → 100 Punkte
+* PEG 1,0–1,5 → 60 Punkte
+* PEG 1,5–2,0 → 30 Punkte
+* PEG > 2,0 → 5 Punkte
+* KGV < 15 → 100 Punkte
+* KGV 15–25 → 60 Punkte
+* KGV 25–35 → 30 Punkte
+* KGV > 35 → 5 Punkte
 
-    **Wachstums-Score (Growth)**
+**Wachstum**
 
-    * EPS-Wachstum > 20 % → 100
-    * EPS-Wachstum 10–20 % → 70
-    * EPS-Wachstum 0–10 % → 40
-    * EPS-Wachstum < 0 % → 0 → **5**
+* EPS-Wachstum > 20 % → 100
+* EPS-Wachstum 10–20 % → 70
+* EPS-Wachstum 0–10 % → 40
+* EPS-Wachstum < 0 % → 5
 
-    * Umsatzwachstum > 15 % → 100
-    * Umsatzwachstum 5–15 % → 60
-    * Umsatzwachstum 0–5 % → 30
-    * Umsatzwachstum < 0 % → 0 → **5**
+* Umsatzwachstum > 15 % → 100
+* Umsatzwachstum 5–15 % → 60
+* Umsatzwachstum 0–5 % → 30
+* Umsatzwachstum < 0 % → 5
 
-    **Finanzielle Gesundheit**
+**Finanzielle Gesundheit**
 
-    * D/E < 0,5 → 100
-    * D/E 0,5–1,5 → 60
-    * D/E > 1,5 → 10
+* D/E < 0,5 → 100
+* D/E 0,5–1,5 → 60
+* D/E > 1,5 → 10
 
-    * Current Ratio > 1,5 → 100
-    * Current Ratio 1,0–1,5 → 50
-    * Current Ratio < 1,0 → 0 → **5**
+* Current Ratio > 1,5 → 100
+* Current Ratio 1,0–1,5 → 50
+* Current Ratio < 1,0 → 5
 
-    **Momentum / Technik**
+**Momentum**
 
-    * Kurs über GD → 100
-    * Kurs unter GD → 20
-    * RSI 40–60 → 100
-    * RSI 30–40 bzw. 60–70 → 70
-    * RSI außerhalb → 20
-    """)
+* Kurs über GD → 100
+* Kurs unter GD → 20
+* RSI 40–60 → 100
+* RSI 30–40 bzw. 60–70 → 70
+* RSI außerhalb → 20
+""")
 
 
 with col2:
 
     st.markdown(
-        "### 🏆 Gesamtscore"
+        "### 🏆 Gesamtscore-Berechnung"
     )
 
     st.markdown(
         "Der Gesamtscore ist ein gewichteter Mittelwert "
-        "der tatsächlich verfügbaren Einzelscores."
+        "der verfügbaren Einzelscores."
     )
 
     st.latex(
         r"""
         Gesamtscore =
         \frac{
-        w_1 V +
-        w_2 G +
-        w_3 H +
-        w_4 M
+        w_1V+w_2G+w_3H+w_4M
         }{
         \sum w_{\mathrm{vorhanden}}
         }
         """
     )
 
-    st.markdown(f"""
-    **Aktuelle Gewichtung**
+    st.markdown(
+        f"""
+**Aktuelle Gewichtung**
 
-    ⚖️ Bewertung: **{w_val_n*100:.1f} %**
+⚖️ Bewertung: **{w_val_n*100:.1f} %**
 
-    🚀 Wachstum: **{w_gro_n*100:.1f} %**
+🚀 Wachstum: **{w_gro_n*100:.1f} %**
 
-    🛡️ Gesundheit: **{w_hea_n*100:.1f} %**
+🛡️ Gesundheit: **{w_hea_n*100:.1f} %**
 
-    📈 Momentum: **{w_mom_n*100:.1f} %**
+📈 Momentum: **{w_mom_n*100:.1f} %**
 
-    ---
+---
 
-    **Wichtig:**
+### Bedeutung der Anzeige
 
-    **— = Daten fehlen**
+**— = Daten fehlen**
 
-    **5 = Daten vorhanden, aber schlechtester Score**
+**5 = Daten vorhanden, aber schlechtester Score**
 
-    Dadurch kann ein echter schlechter Score nicht mehr
-    mit einer Datenlücke verwechselt werden.
+Damit ist eindeutig erkennbar, ob ein Titel tatsächlich
+schlecht bewertet wird oder ob Yahoo die notwendige
+Kennzahl nicht liefert.
 
-    Fehlt beispielsweise das PEG, wird die Bewertung
-    ausschließlich aus dem vorhandenen KGV berechnet.
+Fehlt beispielsweise das PEG, wird der Valuation-Score
+nur aus dem vorhandenen KGV berechnet.
 
-    Fehlen sämtliche Bewertungsdaten, bleibt der
-    Bewertungs-Score **NaN** und wird beim Gesamtscore
-    automatisch nicht berücksichtigt.
-    """)
+Fehlen sämtliche Bewertungsdaten, bleibt der
+Valuation-Score **—** und wird beim Gesamtscore
+nicht berücksichtigt.
+"""
+    )
