@@ -3147,105 +3147,317 @@ if st.button("🚀 Aktien analysieren"):
     st.caption("Score 5 = echter, aber sehr schwacher Score. — = Daten/Berechnung nicht verfügbar.")
     st.dataframe(style_results_table(results_df), use_container_width=True, hide_index=True)
 
-    st.subheader("🧮 V20.0 Score-Analyse")
+    # ========================================================
+    # MATHEMATIK / MODELLLOGIK
+    # ========================================================
 
-    selected_ticker = st.selectbox("Aktie auswählen", results_df['Ticker'].tolist())
-    detail_data = fetch_stock_data(selected_ticker)
+    st.subheader("🧮 Mathematik & Berechnungslogik des Modells")
+    st.caption(
+        "Dieser Bereich ersetzt die bisherige Score-Analyse. Er zeigt die tatsächlich im V20.0-Code "
+        "verwendeten Formeln, Gewichtungen, Interpolationen und Empfehlungsschwellen."
+    )
 
-    if detail_data is not None:
-        detail_metrics = extract_metrics(detail_data)
-        detail_base_score, detail_scores = calculate_scores(detail_metrics)
+    with st.expander("1. Gesamtarchitektur des Modells", expanded=True):
+        st.markdown("""
+### Hierarchie
 
-        detail_score = weighted_available([
-            (detail_scores.get('kpax'), active_weights['kpax']),
-            (detail_scores.get('kpax_fv'), active_weights['kpax_fv']),
-            (detail_scores.get('risk'), active_weights['risk'])
-        ])
+**KPAX** bündelt Unternehmensqualität und Zukunftspotenzial:
 
-        st.markdown(f"### {detail_metrics['name']} ({selected_ticker})")
-        st.caption(f"Sektor: {detail_metrics['sector']}")
+\[
+KPAX = 0{,}40 \cdot Quality + 0{,}60 \cdot Future
+\]
 
-        # ----------------------------------------------------
-        # SCORE TREE
-        # ----------------------------------------------------
-        detail_table = pd.DataFrame({
-            'Kategorie': [
-                'Quality', 'Future', 'KPAX',
-                'Fair Value', 'Relative Valuation', 'KPAX-FV',
-                'Risk', 'Technical', 'Investment Score'
-            ],
-            'Score': [
-                detail_scores.get('quality', np.nan),
-                detail_scores.get('future', np.nan),
-                detail_scores.get('kpax', np.nan),
-                detail_scores.get('fair_value', np.nan),
-                detail_scores.get('valuation', np.nan),
-                detail_scores.get('kpax_fv', np.nan),
-                detail_scores.get('risk', np.nan),
-                detail_scores.get('technical', np.nan),
-                detail_score
-            ],
-            'Bedeutung': [
-                'Aktuelle Unternehmensqualität',
-                'Zukunfts- und Wachstumspotenzial',
-                '40% Quality + 60% Future',
-                'Preis vs. Fair Value',
-                'Relative Bewertung über Multiples',
-                '60% Fair Value + 40% Valuation',
-                '100 = geringes Risiko',
-                'Separates Timing-Signal',
-                '40% KPAX + 50% KPAX-FV + 10% Risk'
-            ]
-        })
+**KPAX-FV** bündelt absolute und relative Preisbewertung:
 
-        detail_table['Score'] = detail_table['Score'].round(1)
-        st.dataframe(
-            detail_table.style.format({'Score': '{:.1f}'}, na_rep='—'),
-            use_container_width=True,
-            hide_index=True
-        )
+\[
+KPAX\text{-}FV = 0{,}60 \cdot Fair\ Value + 0{,}40 \cdot Relative\ Valuation
+\]
 
-        st.markdown("#### 📐 Berechnung")
+Der **Investment Score** enthält bewusst **keinen Technical Score**:
+
+\[
+Investment = w_{KPAX}\cdot KPAX + w_{KPAX-FV}\cdot KPAX\text{-}FV + w_{Risk}\cdot Risk
+\]
+
+Die aktuell eingestellten Gewichte werden in der Sidebar festgelegt und anschließend auf 100 % normalisiert.
+        """)
         st.code(
-            "KPAX = 40% Quality + 60% Future\n"
-            "KPAX-FV = 60% Fair Value + 40% Relative Valuation\n"
-            "Investment Score = "
-            f"{active_weights['kpax'] * 100:.0f}% KPAX + "
-            f"{active_weights['kpax_fv'] * 100:.0f}% KPAX-FV + "
-            f"{active_weights['risk'] * 100:.0f}% Risk\n"
-            "Technical = separat; beeinflusst nur die finale Empfehlung",
+            f"Aktuelle normalisierte Gewichte:\n"
+            f"KPAX       = {active_weights['kpax'] * 100:.1f}%\n"
+            f"KPAX-FV    = {active_weights['kpax_fv'] * 100:.1f}%\n"
+            f"Risk       = {active_weights['risk'] * 100:.1f}%\n\n"
+            "Technical = separat; wird nicht in den Investment Score eingerechnet.",
             language=None
         )
 
-        rec = get_recommendation(
-            detail_score,
-            detail_scores.get('kpax'),
-            detail_scores.get('kpax_fv'),
-            detail_scores.get('technical')
-        )
+    with st.expander("2. Quality Score – Unternehmensqualität"):
+        st.markdown("""
+### Nicht-Finanzunternehmen
 
-        note = get_recommendation_note(
-            detail_score,
-            detail_scores.get('technical')
-        )
+Die verfügbaren Komponenten werden **nur mit ihrem jeweiligen Gewicht berücksichtigt**. Fehlt eine Kennzahl, wird deren Gewicht auf die vorhandenen Komponenten verteilt.
 
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Investment Score", f"{detail_score:.1f}" if pd.notna(detail_score) else "–")
-        with col2:
-            st.metric("KPAX", f"{detail_scores['kpax']:.1f}" if pd.notna(detail_scores.get('kpax')) else "–")
-        with col3:
-            st.metric("KPAX-FV", f"{detail_scores['kpax_fv']:.1f}" if pd.notna(detail_scores.get('kpax_fv')) else "–")
-        with col4:
-            st.metric("Technical", f"{detail_scores['technical']:.1f}" if pd.notna(detail_scores.get('technical')) else "–")
+\[
+Quality = weighted\_average(ROIC, GrossMargin, FCFMargin, EarningsGrowth, RevenueGrowth)
+\]
 
-        st.markdown(f"**Empfehlung:** {rec}")
-        st.markdown(f"**Timing:** {note}")
-        st.markdown(f"**Turnaround Status:** {get_turnaround_status(detail_metrics)}")
-        st.caption(
-            f"Datenvollständigkeit: {detail_metrics['data_completeness']}% · "
-            "Technical ist bewusst nicht Teil des Investment Scores."
-        )
+Gewichte:
+
+| Komponente | Gewicht | Score-Transformation |
+|---|---:|---|
+| ROIC | 30 % | 4 / 8 / 12 / 20 / 35 % → 20 / 45 / 65 / 90 / 100 |
+| Bruttomarge | 15 % | 15 / 30 / 45 / 60 / 75 % → 20 / 40 / 65 / 85 / 100 |
+| FCF-Marge | 20 % | −5 / 0 / 5 / 10 / 20 % → 0 / 30 / 65 / 85 / 100 |
+| Gewinnwachstum | 20 % | −10 / 0 / 5 / 15 / 30 / 50 % → 10 / 35 / 55 / 75 / 90 / 100 |
+| Umsatzwachstum | 10 % | −10 / 0 / 5 / 15 / 30 / 50 % → 10 / 35 / 55 / 75 / 90 / 100 |
+
+Die Interpolation zwischen den Stützpunkten ist linear.
+
+### Financial Services
+
+Bei Banken/Finanzdienstleistern wird ROIC durch ROE ersetzt:
+
+| Komponente | Gewicht |
+|---|---:|
+| ROE | 40 % |
+| Nettomarge | 30 % |
+| Gewinnwachstum | 20 % |
+| Umsatzwachstum | 10 % |
+| 
+
+ROE: 4 / 8 / 12 / 18 / 25 % → 20 / 45 / 70 / 90 / 100.
+Nettomarge: 5 / 10 / 20 / 30 / 40 % → 20 / 45 / 70 / 90 / 100.
+        """)
+
+    with st.expander("3. Future Score – Zukunftspotenzial"):
+        st.markdown("""
+\[
+Future = weighted\_average(EarningsGrowth, RevenueGrowth, LongTermGrowth,
+AnalystUpside, FCFMargin, GrowthAcceleration)
+\]
+
+| Komponente | Gewicht | Bewertungslogik |
+|---|---:|---|
+| Gewinnwachstum | 30 % | −10 / 0 / 5 / 15 / 30 / 50 % → 10 / 35 / 55 / 75 / 90 / 100 |
+| Umsatzwachstum | 20 % | gleiche Transformation |
+| Langfristiges Wachstum | 15 % | −5 / 0 / 5 / 10 / 20 / 35 % → 15 / 35 / 55 / 70 / 90 / 100 |
+| Analysten-Upside | 15 % | −30 / −10 / 0 / 10 / 20 / 40 / 70 % → 0 / 20 / 40 / 60 / 75 / 90 / 100 |
+| FCF-Marge | 10 % | −5 / 0 / 5 / 10 / 20 % → 0 / 30 / 65 / 85 / 100 |
+| Wachstumsbeschleunigung | 10 % | \(EarningsGrowth - LongTermGrowth\) |
+
+Für die Wachstumsbeschleunigung gilt:
+
+\[
+Acceleration = EarningsGrowth - LongTermGrowth
+\]
+
+und die lineare Score-Transformation:
+
+−20 / −5 / 0 / 5 / 15 / 30 % → 10 / 30 / 50 / 65 / 85 / 100.
+        """)
+
+    with st.expander("4. Fair Value Score – absolute Preisattraktivität"):
+        st.markdown("""
+Der Fair-Value-Score wird aus dem bereits berechneten Fair Value relativ zum aktuellen Aktienkurs abgeleitet.
+
+\[
+Upside = \frac{FairValue}{CurrentPrice}-1
+\]
+
+Danach erfolgt eine lineare Interpolation:
+
+| Upside | Score |
+|---:|---:|
+| −40 % | 0 → intern auf mindestens 5 begrenzt |
+| −20 % | 15 |
+| 0 % | 40 |
+| +10 % | 58 |
+| +25 % | 75 |
+| +50 % | 90 |
+| +75 % | 100 |
+
+**Wichtig:** Ein berechneter, aber extrem schlechter Wert ist damit ein echter niedriger Score. Fehlen dagegen sämtliche Fair-Value-Daten, bleibt der Wert `None/—`.
+
+Die eigentliche V20.0-Fair-Value-Berechnung verwendet aktuell zwei mögliche Quellen:
+
+\[
+FairValue = 0{,}75\cdot AnalystTarget + 0{,}25\cdot FCF\text{-}FairValue
+\]
+
+wenn beide Quellen vorhanden sind. Ist nur eine Quelle vorhanden, wird diese allein verwendet.
+
+### FCF-DCF
+
+Zunächst:
+
+\[
+FCFYield = \frac{FCF}{MarketCap}
+\]
+
+\[
+FCF/share = FCFYield\cdot CurrentPrice
+\]
+
+Das FCF wird fünf Jahre projiziert. Das jährliche Wachstum wird dabei linear vom Startwachstum zum Terminalwachstum von 2,5 % zurückgeführt.
+
+\[
+FCF_t = FCF_{t-1}\cdot(1+g_t)
+\]
+
+\[
+PV(FCF_t)=\frac{FCF_t}{(1+r)^t}
+\]
+
+Terminal Value:
+
+\[
+TV=\frac{FCF_5\cdot(1+g_{terminal})}{r-g_{terminal}}
+\]
+
+\[
+FairValue_{DCF}=\sum_{t=1}^{5}PV(FCF_t)+PV(TV)
+\]
+
+Aktuelle Modellparameter:
+- Diskontsatz \(r = 9\%\)
+- Terminal Growth \(g_{terminal}=2{,}5\%\)
+- Prognosezeitraum = 5 Jahre
+- Startwachstum wird auf −3 % bis +12 % begrenzt.
+
+Zusätzlich verwirft der aktuelle Code DCF-Werte außerhalb von **60 % bis 175 % des aktuellen Aktienkurses**. Das ist eine Plausibilitätsbremse und keine mathematische Eigenschaft eines DCF.
+        """)
+
+    with st.expander("5. Relative Valuation Score"):
+        st.markdown("""
+Die relative Bewertung besteht aus mehreren Multiples. Auch hier werden nur tatsächlich vorhandene Kennzahlen gewichtet.
+
+| Kennzahl | Gewicht | Score-Stützpunkte |
+|---|---:|---|
+| Forward-KGV | 40 % | 5 / 10 / 15 / 22 / 35 / 60 → 100 / 92 / 80 / 65 / 25 / 0 |
+| Trailing-KGV | 20 % | 5 / 10 / 15 / 22 / 35 / 60 → 100 / 92 / 80 / 65 / 25 / 0 |
+| Forward-PEG | 20 % | 0,4 / 0,8 / 1,0 / 1,5 / 2,5 / 4,0 → 100 / 92 / 80 / 60 / 20 / 0 |
+| P/S bzw. P/B | 20 % | sektorspezifisch |
+
+Für Financial Services wird P/B verwendet:
+
+0,5 / 0,8 / 1,1 / 1,6 / 2,5 / 4,0 → 100 / 92 / 80 / 55 / 20 / 0.
+
+Für andere Unternehmen wird P/S verwendet:
+
+0,5 / 1,5 / 3 / 5 / 8 → 100 / 85 / 60 / 30 / 0.
+        """)
+
+    with st.expander("6. Risk Score – Robustheit und Risiko"):
+        st.markdown("""
+Der Risk Score ist so definiert, dass **100 = geringes Risiko** und **5 ≈ sehr hohes Risiko** bedeutet.
+
+\[
+Risk = 40\%\cdot FinancialRisk + 30\%\cdot MarketRisk + 30\%\cdot StabilityRisk
+\]
+
+### Financial Risk – Nicht-Finanzunternehmen
+
+\[
+FinancialRisk = 45\%\cdot NetDebt/EBITDA + 20\%\cdot CurrentRatio + 35\%\cdot Debt/Equity
+\]
+
+### Market Risk
+
+\[
+MarketRisk = 50\%\cdot VolatilityScore + 50\%\cdot DrawdownScore
+\]
+
+### Stability
+
+\[
+StabilityRisk = 40\%\cdot RevenueStability + 60\%\cdot EarningsStability
+\]
+
+Die einzelnen Kennzahlen werden jeweils über lineare Interpolation auf eine 0–100-Skala transformiert. Fehlende Komponenten werden nicht mit 0 bestraft; ihr Gewicht wird auf die verfügbaren Komponenten umgelegt.
+
+Bei Financial Services werden statt Net Debt/EBITDA und Current Ratio die dort sinnvolleren Größen Debt/Equity und Cash/Debt verwendet.
+        """)
+
+    with st.expander("7. Technical Score – separates Timing-Modell"):
+        st.markdown("""
+Der Technical Score fließt **nicht** in den Investment Score ein. Er beeinflusst ausschließlich die finale Empfehlung als nachgelagerter Gatekeeper.
+
+\[
+Technical = weighted\_average(SMA200, Performance6M, RSI, MACD, SMA50)
+\]
+
+Gewichte:
+
+| Signal | Gewicht | Kernlogik |
+|---|---:|---|
+| Kurs über SMA200 | 25 % | Ja = 80, Nein = 30 |
+| 6-Monats-Performance | 25 % | −40 / −20 / 0 / 15 / 35 / 60 % → 0 / 20 / 45 / 70 / 90 / 100 |
+| RSI(14) | 20 % | 20 / 30 / 40 / 50 / 60 / 70 / 80 / 90 → 20 / 35 / 55 / 68 / 78 / 85 / 70 / 50 |
+| MACD | 20 % | Basis 70 bei MACD > Signal, sonst 35; Histogramm ±15/−10 |
+| Kurs über SMA50 | 10 % | Ja = 80, Nein = 35 |
+
+RSI, MACD und gleitende Durchschnitte werden aus den historischen Kursdaten berechnet.
+        """)
+
+    with st.expander("8. Datenverfügbarkeit, fehlende Werte und Score-Minimum"):
+        st.markdown("""
+### Fehlende Daten
+
+Das Modell verwendet grundsätzlich:
+
+\[
+weighted\_available = \frac{\sum(score_i\cdot weight_i)}{\sum weight_i}
+\]
+
+wobei nur vorhandene Scores in die Berechnung eingehen.
+
+Damit wird ein fehlender Wert **nicht automatisch als 0** behandelt.
+
+### Mindestwert
+
+Der interne Score wird auf folgende Grenzen begrenzt:
+
+\[
+Score = clip(Score, 5, 100)
+\]
+
+Daher gilt:
+
+- **5–100:** echter berechneter Score
+- **— / None:** benötigte Daten bzw. Berechnung nicht verfügbar
+
+Das verhindert, dass eine Datenlücke fälschlich wie ein extrem schlechter Score aussieht.
+        """)
+
+    with st.expander("9. Finale Empfehlung – Score + Technical Gate"):
+        st.markdown("""
+Zuerst wird aus dem Investment Score die fundamentale Empfehlung bestimmt:
+
+| Investment Score | Basis-Empfehlung |
+|---:|---|
+| ≥ 85 und KPAX ≥ 80 und KPAX-FV ≥ 80 | **Strong Buy** |
+| ≥ 80 und KPAX ≥ 75 | **Buy** |
+| ≥ 75 | **Accumulate** |
+| ≥ 68 | **Hold** |
+| ≥ 55 | **Reduce / Watch** |
+| < 55 | **Avoid** |
+
+Danach kann Technical die Empfehlung **nur herabstufen, niemals verbessern**:
+
+| Technical Score | Maximale Empfehlung |
+|---:|---|
+| < 30 | Hold |
+| 30–44,9 | Accumulate |
+| 45–59,9 | Buy |
+| ≥ 60 | keine technische Herabstufung |
+
+Damit bleibt die fundamentale Investmentbewertung unabhängig von kurzfristiger Markttechnik, während schlechtes technisches Timing eine zu aggressive Handlungsempfehlung verhindert.
+        """)
+
+    st.info(
+        "Hinweis: Dieser Bereich dokumentiert bewusst die Mathematik des aktuellen V20.0-Modells. "
+        "Er verändert keine Scores und keine Datenbeschaffung. Die Fair-Value-Methodik selbst können wir "
+        "im nächsten Schritt separat mathematisch verbessern."
+    )
 
 else:
     st.info("Ticker eingeben und „🚀 Aktien analysieren“ klicken.")
