@@ -9,12 +9,12 @@ import numbers
 # ==============================================================================
 
 st.set_page_config(
-    page_title="KPAX Screener V20.2",
+    page_title="KPAX Screener V21.0",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("KPAX Screener V20.2")
+st.title("KPAX Screener V21.0")
 
 DEFAULT_TICKERS = [
     "SMO", "BMW.DE", "MAIR", "GOOGL", "IFX.DE", "1810.HK", "PEP", "KO",
@@ -29,40 +29,13 @@ DEFAULT_TICKERS = [
 # 2. HILFSFUNKTIONEN
 # ==============================================================================
 
-def is_valid_number(value):
-    """Prüft, ob ein Wert eine gültige Zahl ist."""
-
-    return (
-        isinstance(value, numbers.Number)
-        and not isinstance(value, bool)
-        and np.isfinite(value)
-    )
-
-
-def minimum_score(score):
-    """
-    Echter Score:
-        0 -> 5
-        10 -> 10
-        ...
-        100 -> 100
-
-    NaN bleibt NaN = Daten fehlen.
-    """
-
-    if pd.isna(score):
-        return np.nan
-
-    return max(5.0, float(score))
-
-
 def safe_float(value):
-    """Konvertiert Zahlen robust nach float."""
 
     if value is None:
         return np.nan
 
     try:
+
         value = float(value)
 
         if np.isfinite(value):
@@ -74,9 +47,13 @@ def safe_float(value):
     return np.nan
 
 
-# ==============================================================================
-# 3. RSI
-# ==============================================================================
+def minimum_score(score):
+
+    if pd.isna(score):
+        return np.nan
+
+    return max(5.0, float(score))
+
 
 def calc_rsi(prices, period=14):
 
@@ -99,39 +76,35 @@ def calc_rsi(prices, period=14):
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
 
-    last_gain = avg_gain.iloc[-1]
-    last_loss = avg_loss.iloc[-1]
+    g = avg_gain.iloc[-1]
+    l = avg_loss.iloc[-1]
 
-    if pd.isna(last_gain) or pd.isna(last_loss):
+    if pd.isna(g) or pd.isna(l):
         return np.nan
 
-    if last_loss == 0:
+    if l == 0:
         return 100.0
 
-    rs = last_gain / last_loss
+    rs = g / l
 
     return 100 - (100 / (1 + rs))
 
 
 # ==============================================================================
-# 4. EINZELSCORES
+# 3. SCORE-BERECHNUNG
 # ==============================================================================
 
 def calculate_individual_scores(info, hist):
 
-    if not isinstance(info, dict):
-        info = {}
-
-    # ==========================================================================
+    # --------------------------------------------------------------------------
     # VALUATION
-    # ==========================================================================
+    # --------------------------------------------------------------------------
 
     pe = safe_float(info.get("trailingPE"))
     peg = safe_float(info.get("pegRatio"))
 
     valuation_points = []
 
-    # PEG
     if not pd.isna(peg) and peg > 0:
 
         if peg < 1.0:
@@ -146,7 +119,6 @@ def calculate_individual_scores(info, hist):
         else:
             valuation_points.append(0)
 
-    # KGV
     if not pd.isna(pe) and pe > 0:
 
         if pe < 15:
@@ -161,17 +133,16 @@ def calculate_individual_scores(info, hist):
         else:
             valuation_points.append(0)
 
-    if valuation_points:
-        valuation_score = minimum_score(
-            np.mean(valuation_points)
-        )
-    else:
-        valuation_score = np.nan
+    valuation_score = (
+        minimum_score(np.mean(valuation_points))
+        if valuation_points
+        else np.nan
+    )
 
 
-    # ==========================================================================
+    # --------------------------------------------------------------------------
     # GROWTH
-    # ==========================================================================
+    # --------------------------------------------------------------------------
 
     earnings_growth = safe_float(
         info.get("earningsGrowth")
@@ -183,7 +154,6 @@ def calculate_individual_scores(info, hist):
 
     growth_points = []
 
-    # EPS-Wachstum
     if not pd.isna(earnings_growth):
 
         if earnings_growth > 0.20:
@@ -198,7 +168,6 @@ def calculate_individual_scores(info, hist):
         else:
             growth_points.append(0)
 
-    # Umsatzwachstum
     if not pd.isna(revenue_growth):
 
         if revenue_growth > 0.15:
@@ -213,17 +182,16 @@ def calculate_individual_scores(info, hist):
         else:
             growth_points.append(0)
 
-    if growth_points:
-        growth_score = minimum_score(
-            np.mean(growth_points)
-        )
-    else:
-        growth_score = np.nan
+    growth_score = (
+        minimum_score(np.mean(growth_points))
+        if growth_points
+        else np.nan
+    )
 
 
-    # ==========================================================================
-    # FINANCIAL HEALTH
-    # ==========================================================================
+    # --------------------------------------------------------------------------
+    # HEALTH
+    # --------------------------------------------------------------------------
 
     debt_to_equity = safe_float(
         info.get("debtToEquity")
@@ -235,27 +203,23 @@ def calculate_individual_scores(info, hist):
 
     health_points = []
 
-    # Debt / Equity
     if not pd.isna(debt_to_equity):
 
-        # Yahoo liefert D/E meistens als Prozentwert.
-        # 80 = 80 % = 0.8
-        de_ratio = (
+        de = (
             debt_to_equity / 100
             if debt_to_equity > 10
             else debt_to_equity
         )
 
-        if de_ratio < 0.5:
+        if de < 0.5:
             health_points.append(100)
 
-        elif de_ratio <= 1.5:
+        elif de <= 1.5:
             health_points.append(60)
 
         else:
             health_points.append(10)
 
-    # Current Ratio
     if not pd.isna(current_ratio):
 
         if current_ratio > 1.5:
@@ -267,50 +231,41 @@ def calculate_individual_scores(info, hist):
         else:
             health_points.append(0)
 
-    if health_points:
-        health_score = minimum_score(
-            np.mean(health_points)
-        )
-    else:
-        health_score = np.nan
+    health_score = (
+        minimum_score(np.mean(health_points))
+        if health_points
+        else np.nan
+    )
 
 
-    # ==========================================================================
-    # MOMENTUM / TECHNIK
-    # ==========================================================================
+    # --------------------------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------------------------
 
     tech_points = []
 
     if hist is not None and not hist.empty:
 
-        close_prices = pd.to_numeric(
+        close = pd.to_numeric(
             hist["Close"],
             errors="coerce"
         ).dropna()
 
-        if len(close_prices) >= 50:
+        if len(close) >= 50:
 
-            current_price = close_prices.iloc[-1]
+            current_price = close.iloc[-1]
 
-            # GD200 bzw. längstmöglicher Durchschnitt
-            window = min(
-                200,
-                len(close_prices)
-            )
+            window = min(200, len(close))
 
             sma = (
-                close_prices
+                close
                 .rolling(window)
                 .mean()
                 .iloc[-1]
             )
 
-            rsi = calc_rsi(
-                close_prices,
-                14
-            )
+            rsi = calc_rsi(close)
 
-            # Kurs vs. GD
             if not pd.isna(sma):
 
                 if current_price > sma:
@@ -318,7 +273,6 @@ def calculate_individual_scores(info, hist):
                 else:
                     tech_points.append(20)
 
-            # RSI
             if not pd.isna(rsi):
 
                 if 40 <= rsi <= 60:
@@ -330,12 +284,11 @@ def calculate_individual_scores(info, hist):
                 else:
                     tech_points.append(20)
 
-    if tech_points:
-        momentum_score = minimum_score(
-            np.mean(tech_points)
-        )
-    else:
-        momentum_score = np.nan
+    momentum_score = (
+        minimum_score(np.mean(tech_points))
+        if tech_points
+        else np.nan
+    )
 
 
     return {
@@ -347,28 +300,450 @@ def calculate_individual_scores(info, hist):
 
 
 # ==============================================================================
-# 5. DATENABRUF
+# 4. FUNDAMENTALDATEN HOLEN
+# ==============================================================================
+
+def get_fundamental_data(symbol):
+
+    ticker = yf.Ticker(symbol)
+
+    info = {}
+    valuation = pd.DataFrame()
+    income = pd.DataFrame()
+    balance = pd.DataFrame()
+
+    diagnostics = {
+        "Info": "FEHLT",
+        "Valuation": "FEHLT",
+        "Income": "FEHLT",
+        "Balance": "FEHLT"
+    }
+
+    # --------------------------------------------------------------------------
+    # INFO
+    # --------------------------------------------------------------------------
+
+    try:
+
+        info = ticker.get_info()
+
+        if isinstance(info, dict) and len(info) > 0:
+            diagnostics["Info"] = "OK"
+
+        else:
+            info = {}
+
+    except Exception:
+        info = {}
+
+
+    # --------------------------------------------------------------------------
+    # VALUATION
+    # --------------------------------------------------------------------------
+
+    try:
+
+        valuation = ticker.get_valuation_measures(
+            freq="trailing",
+            periods=1
+        )
+
+        if (
+            isinstance(valuation, pd.DataFrame)
+            and not valuation.empty
+        ):
+            diagnostics["Valuation"] = "OK"
+
+    except Exception:
+        valuation = pd.DataFrame()
+
+
+    # --------------------------------------------------------------------------
+    # INCOME STATEMENT
+    # --------------------------------------------------------------------------
+
+    try:
+
+        income = ticker.get_income_stmt(
+            freq="yearly"
+        )
+
+        if (
+            isinstance(income, pd.DataFrame)
+            and not income.empty
+        ):
+            diagnostics["Income"] = "OK"
+
+    except Exception:
+        income = pd.DataFrame()
+
+
+    # --------------------------------------------------------------------------
+    # BALANCE SHEET
+    # --------------------------------------------------------------------------
+
+    try:
+
+        balance = ticker.get_balance_sheet(
+            freq="yearly"
+        )
+
+        if (
+            isinstance(balance, pd.DataFrame)
+            and not balance.empty
+        ):
+            diagnostics["Balance"] = "OK"
+
+    except Exception:
+        balance = pd.DataFrame()
+
+
+    # ==========================================================================
+    # HILFSFUNKTION: VALUE AUS INFO
+    # ==========================================================================
+
+    def info_value(*keys):
+
+        for key in keys:
+
+            if key in info:
+
+                value = safe_float(
+                    info.get(key)
+                )
+
+                if not pd.isna(value):
+                    return value
+
+        return np.nan
+
+
+    # ==========================================================================
+    # VALUATION VALUE
+    # ==========================================================================
+
+    def valuation_value(*keys):
+
+        if valuation is None or valuation.empty:
+            return np.nan
+
+        for key in keys:
+
+            # Direkter Index
+            if key in valuation.index:
+
+                try:
+
+                    value = valuation.loc[key]
+
+                    if isinstance(value, pd.Series):
+                        value = value.iloc[-1]
+
+                    value = safe_float(value)
+
+                    if not pd.isna(value):
+                        return value
+
+                except Exception:
+                    pass
+
+            # Spalten
+            if key in valuation.columns:
+
+                try:
+
+                    value = valuation[key]
+
+                    if isinstance(value, pd.Series):
+                        value = value.iloc[-1]
+
+                    value = safe_float(value)
+
+                    if not pd.isna(value):
+                        return value
+
+                except Exception:
+                    pass
+
+        return np.nan
+
+
+    # ==========================================================================
+    # KGV
+    # ==========================================================================
+
+    pe = info_value(
+        "trailingPE"
+    )
+
+    if pd.isna(pe):
+
+        pe = valuation_value(
+            "PeRatio",
+            "Trailing P/E"
+        )
+
+
+    # ==========================================================================
+    # PEG
+    # ==========================================================================
+
+    peg = info_value(
+        "pegRatio"
+    )
+
+    if pd.isna(peg):
+
+        peg = valuation_value(
+            "PegRatio",
+            "PEG Ratio (5yr expected)"
+        )
+
+
+    # ==========================================================================
+    # GROWTH
+    # ==========================================================================
+
+    earnings_growth = info_value(
+        "earningsGrowth"
+    )
+
+    revenue_growth = info_value(
+        "revenueGrowth"
+    )
+
+
+    # ==========================================================================
+    # FALLBACK: GROWTH AUS INCOME STATEMENT
+    # ==========================================================================
+
+    if income is not None and not income.empty:
+
+        try:
+
+            # EPS
+            eps_row = None
+
+            for candidate in [
+                "DilutedEPS",
+                "BasicEPS",
+                "Diluted EPS",
+                "Basic EPS"
+            ]:
+
+                if candidate in income.index:
+                    eps_row = candidate
+                    break
+
+            if eps_row is not None:
+
+                eps_series = pd.to_numeric(
+                    income.loc[eps_row],
+                    errors="coerce"
+                ).dropna()
+
+                if len(eps_series) >= 2:
+
+                    latest = eps_series.iloc[0]
+                    previous = eps_series.iloc[1]
+
+                    if (
+                        previous != 0
+                        and pd.isna(earnings_growth)
+                    ):
+
+                        earnings_growth = (
+                            latest / previous
+                        ) - 1
+
+
+            # Revenue
+            revenue_row = None
+
+            for candidate in [
+                "TotalRevenue",
+                "OperatingRevenue",
+                "Total Revenue"
+            ]:
+
+                if candidate in income.index:
+                    revenue_row = candidate
+                    break
+
+            if revenue_row is not None:
+
+                revenue_series = pd.to_numeric(
+                    income.loc[revenue_row],
+                    errors="coerce"
+                ).dropna()
+
+                if len(revenue_series) >= 2:
+
+                    latest = revenue_series.iloc[0]
+                    previous = revenue_series.iloc[1]
+
+                    if (
+                        previous != 0
+                        and pd.isna(revenue_growth)
+                    ):
+
+                        revenue_growth = (
+                            latest / previous
+                        ) - 1
+
+        except Exception:
+            pass
+
+
+    # ==========================================================================
+    # HEALTH
+    # ==========================================================================
+
+    debt_to_equity = info_value(
+        "debtToEquity"
+    )
+
+    current_ratio = info_value(
+        "currentRatio"
+    )
+
+
+    # ==========================================================================
+    # FALLBACK BALANCE SHEET
+    # ==========================================================================
+
+    if balance is not None and not balance.empty:
+
+        try:
+
+            def bs_value(*names):
+
+                for name in names:
+
+                    if name in balance.index:
+
+                        series = pd.to_numeric(
+                            balance.loc[name],
+                            errors="coerce"
+                        ).dropna()
+
+                        if not series.empty:
+                            return float(series.iloc[0])
+
+                return np.nan
+
+
+            total_debt = bs_value(
+                "TotalDebt",
+                "LongTermDebtAndCapitalLeaseObligations",
+                "LongTermDebt"
+            )
+
+            equity = bs_value(
+                "StockholdersEquity",
+                "CommonStockEquity",
+                "TotalEquityGrossMinorityInterest"
+            )
+
+            current_assets = bs_value(
+                "CurrentAssets"
+            )
+
+            current_liabilities = bs_value(
+                "CurrentLiabilities"
+            )
+
+
+            if (
+                pd.isna(debt_to_equity)
+                and not pd.isna(total_debt)
+                and not pd.isna(equity)
+                and equity != 0
+            ):
+
+                debt_to_equity = (
+                    total_debt / equity
+                ) * 100
+
+
+            if (
+                pd.isna(current_ratio)
+                and not pd.isna(current_assets)
+                and not pd.isna(current_liabilities)
+                and current_liabilities != 0
+            ):
+
+                current_ratio = (
+                    current_assets /
+                    current_liabilities
+                )
+
+        except Exception:
+            pass
+
+
+    # ==========================================================================
+    # DIVIDEND
+    # ==========================================================================
+
+    div_yield = info_value(
+        "dividendYield"
+    )
+
+    if not pd.isna(div_yield):
+
+        if div_yield < 1:
+            div_yield *= 100
+
+
+    # ==========================================================================
+    # RESULTAT
+    # ==========================================================================
+
+    fundamental_info = {
+
+        "trailingPE": pe,
+
+        "pegRatio": peg,
+
+        "earningsGrowth": earnings_growth,
+
+        "revenueGrowth": revenue_growth,
+
+        "debtToEquity": debt_to_equity,
+
+        "currentRatio": current_ratio
+    }
+
+
+    return (
+        ticker,
+        info,
+        fundamental_info,
+        div_yield,
+        diagnostics
+    )
+
+
+# ==============================================================================
+# 5. KOMPLETTER DATENABRUF
 # ==============================================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_screener_data(tickers):
 
-    tickers = list(dict.fromkeys(tickers))
-
     data = []
     errors = []
+    diagnostics = []
 
-    if not tickers:
-        return pd.DataFrame(), []
-
-    # ==========================================================================
-    # KURSDATEN
-    # ==========================================================================
+    # --------------------------------------------------------------------------
+    # KURSE
+    # --------------------------------------------------------------------------
 
     try:
 
         hist_all = yf.download(
-            tickers=tickers,
+            tickers=list(tickers),
             period="1y",
             interval="1d",
             auto_adjust=False,
@@ -379,22 +754,24 @@ def fetch_screener_data(tickers):
 
     except Exception as e:
 
-        return pd.DataFrame(), [
-            f"Kursabruf fehlgeschlagen: {e}"
-        ]
+        return (
+            pd.DataFrame(),
+            [f"Kursabruf: {e}"],
+            pd.DataFrame()
+        )
 
 
-    # ==========================================================================
-    # EINZELNE TICKER
-    # ==========================================================================
+    # --------------------------------------------------------------------------
+    # TICKER
+    # --------------------------------------------------------------------------
 
     for symbol in tickers:
 
         try:
 
-            # ------------------------------------------------------------------
+            # ==============================================================
             # HISTORIE
-            # ------------------------------------------------------------------
+            # ==============================================================
 
             if len(tickers) == 1:
 
@@ -404,9 +781,9 @@ def fetch_screener_data(tickers):
 
                 try:
                     hist = hist_all[symbol].copy()
-
                 except Exception:
                     hist = pd.DataFrame()
+
 
             if hist.empty or "Close" not in hist.columns:
 
@@ -416,158 +793,66 @@ def fetch_screener_data(tickers):
 
                 continue
 
+
             hist = hist.dropna(
                 subset=["Close"]
             )
 
+
             if hist.empty:
-
-                errors.append(
-                    f"{symbol}: leere Kursdaten"
-                )
-
                 continue
 
-
-            # ------------------------------------------------------------------
-            # KURS
-            # ------------------------------------------------------------------
 
             current_price = safe_float(
                 hist["Close"].iloc[-1]
             )
 
 
-            # ------------------------------------------------------------------
-            # YAHOO TICKER
-            # ------------------------------------------------------------------
-
-            ticker = yf.Ticker(symbol)
-
-
-            # ------------------------------------------------------------------
-            # INFO
-            # ------------------------------------------------------------------
-
-            info = {}
-
-            try:
-
-                info = ticker.get_info()
-
-                if not isinstance(info, dict):
-                    info = {}
-
-            except Exception:
-
-                info = {}
-
-
-            # ------------------------------------------------------------------
-            # FALLBACK: FAST INFO
-            # ------------------------------------------------------------------
-
-            fast_info = {}
-
-            try:
-
-                fast_info = dict(
-                    ticker.fast_info
-                )
-
-            except Exception:
-
-                fast_info = {}
-
-
-            # ------------------------------------------------------------------
+            # ==============================================================
             # FUNDAMENTALDATEN
-            # ------------------------------------------------------------------
+            # ==============================================================
 
-            pe = safe_float(
-                info.get("trailingPE")
-            )
-
-            peg = safe_float(
-                info.get("pegRatio")
-            )
-
-            earnings_growth = safe_float(
-                info.get("earningsGrowth")
-            )
-
-            revenue_growth = safe_float(
-                info.get("revenueGrowth")
-            )
-
-            debt_to_equity = safe_float(
-                info.get("debtToEquity")
-            )
-
-            current_ratio = safe_float(
-                info.get("currentRatio")
-            )
-
-            div_yield = safe_float(
-                info.get("dividendYield")
-            )
+            (
+                ticker,
+                raw_info,
+                info,
+                div_yield,
+                diag
+            ) = get_fundamental_data(symbol)
 
 
-            # ------------------------------------------------------------------
-            # DIVIDENDENRENDITE
-            # ------------------------------------------------------------------
-
-            if not pd.isna(div_yield):
-
-                if div_yield < 1:
-                    div_yield *= 100
-
-
-            # ------------------------------------------------------------------
+            # ==============================================================
             # SCORES
-            # ------------------------------------------------------------------
+            # ==============================================================
 
             scores = calculate_individual_scores(
-
-                {
-                    "trailingPE": pe,
-                    "pegRatio": peg,
-                    "earningsGrowth": earnings_growth,
-                    "revenueGrowth": revenue_growth,
-                    "debtToEquity": debt_to_equity,
-                    "currentRatio": current_ratio
-                },
-
+                info,
                 hist
             )
 
 
-            # ------------------------------------------------------------------
+            # ==============================================================
             # NAME
-            # ------------------------------------------------------------------
+            # ==============================================================
 
-            name = info.get(
+            name = raw_info.get(
                 "shortName",
-                info.get(
+                raw_info.get(
                     "longName",
                     symbol
                 )
             )
 
 
-            # ------------------------------------------------------------------
-            # SEKTOR
-            # ------------------------------------------------------------------
-
-            sector = info.get(
+            sector = raw_info.get(
                 "sector",
                 "N/A"
             )
 
 
-            # ------------------------------------------------------------------
-            # DATENZEILE
-            # ------------------------------------------------------------------
+            # ==============================================================
+            # DATAFRAME
+            # ==============================================================
 
             data.append({
 
@@ -579,11 +864,19 @@ def fetch_screener_data(tickers):
 
                 "Kurs": current_price,
 
-                "KGV (P/E)": pe,
+                "KGV (P/E)": info["trailingPE"],
 
-                "PEG": peg,
+                "PEG": info["pegRatio"],
 
                 "Div. Rendite (%)": div_yield,
+
+                "EPS Wachstum": info["earningsGrowth"],
+
+                "Umsatz Wachstum": info["revenueGrowth"],
+
+                "Debt/Equity": info["debtToEquity"],
+
+                "Current Ratio": info["currentRatio"],
 
                 "Bewertung": scores["Valuation"],
 
@@ -595,6 +888,60 @@ def fetch_screener_data(tickers):
             })
 
 
+            # ==============================================================
+            # DIAGNOSE
+            # ==============================================================
+
+            diagnostics.append({
+
+                "Symbol": symbol,
+
+                "Info": diag["Info"],
+
+                "Valuation API": diag["Valuation"],
+
+                "Income Statement": diag["Income"],
+
+                "Balance Sheet": diag["Balance"],
+
+                "KGV": (
+                    "OK"
+                    if not pd.isna(info["trailingPE"])
+                    else "—"
+                ),
+
+                "PEG": (
+                    "OK"
+                    if not pd.isna(info["pegRatio"])
+                    else "—"
+                ),
+
+                "EPS Growth": (
+                    "OK"
+                    if not pd.isna(info["earningsGrowth"])
+                    else "—"
+                ),
+
+                "Revenue Growth": (
+                    "OK"
+                    if not pd.isna(info["revenueGrowth"])
+                    else "—"
+                ),
+
+                "D/E": (
+                    "OK"
+                    if not pd.isna(info["debtToEquity"])
+                    else "—"
+                ),
+
+                "Current Ratio": (
+                    "OK"
+                    if not pd.isna(info["currentRatio"])
+                    else "—"
+                )
+            })
+
+
         except Exception as e:
 
             errors.append(
@@ -602,7 +949,11 @@ def fetch_screener_data(tickers):
             )
 
 
-    return pd.DataFrame(data), errors
+    return (
+        pd.DataFrame(data),
+        errors,
+        pd.DataFrame(diagnostics)
+    )
 
 
 # ==============================================================================
@@ -632,40 +983,23 @@ st.sidebar.subheader("⚖️ Score-Gewichtung")
 
 w_val = st.sidebar.slider(
     "Gewicht Bewertung",
-    0.0,
-    1.0,
-    0.30,
-    0.05
+    0.0, 1.0, 0.30, 0.05
 )
 
 w_gro = st.sidebar.slider(
     "Gewicht Wachstum",
-    0.0,
-    1.0,
-    0.30,
-    0.05
+    0.0, 1.0, 0.30, 0.05
 )
 
 w_hea = st.sidebar.slider(
     "Gewicht Gesundheit",
-    0.0,
-    1.0,
-    0.20,
-    0.05
+    0.0, 1.0, 0.20, 0.05
 )
 
 w_mom = st.sidebar.slider(
     "Gewicht Momentum",
-    0.0,
-    1.0,
-    0.20,
-    0.05
+    0.0, 1.0, 0.20, 0.05
 )
-
-
-# ==============================================================================
-# 8. GEWICHTE NORMALISIEREN
-# ==============================================================================
 
 total_w = (
     w_val +
@@ -690,24 +1024,24 @@ else:
 
 
 # ==============================================================================
-# 9. DATEN LADEN
+# 8. DATEN LADEN
 # ==============================================================================
 
 with st.spinner("📡 Lade Yahoo-Finance-Daten..."):
 
-    df, errors = fetch_screener_data(
+    df, errors, diagnostics = fetch_screener_data(
         tuple(active_tickers)
     )
 
 
 # ==============================================================================
-# 10. DIAGNOSE
+# 9. FEHLER
 # ==============================================================================
 
 if errors:
 
     with st.expander(
-        f"⚠️ Datenhinweise ({len(errors)})"
+        f"⚠️ Fehler / Hinweise ({len(errors)})"
     ):
 
         for error in errors:
@@ -715,7 +1049,7 @@ if errors:
 
 
 # ==============================================================================
-# 11. SCORE BERECHNEN
+# 10. GESAMTSCORE
 # ==============================================================================
 
 if not df.empty:
@@ -723,9 +1057,13 @@ if not df.empty:
     def compute_total_score(row):
 
         values = [
+
             (row["Bewertung"], w_val_n),
+
             (row["Wachstum"], w_gro_n),
+
             (row["Gesundheit"], w_hea_n),
+
             (row["Momentum"], w_mom_n)
         ]
 
@@ -739,13 +1077,13 @@ if not df.empty:
             return np.nan
 
         scores = [
-            item[0]
-            for item in valid
+            x[0]
+            for x in valid
         ]
 
         weights = [
-            item[1]
-            for item in valid
+            x[1]
+            for x in valid
         ]
 
         return np.average(
@@ -760,10 +1098,6 @@ if not df.empty:
     )
 
 
-    # ==========================================================================
-    # SORTIEREN
-    # ==========================================================================
-
     df = (
         df
         .sort_values(
@@ -776,7 +1110,7 @@ if not df.empty:
 
 
     # ==========================================================================
-    # TABELLE
+    # HAUPTTABELLE
     # ==========================================================================
 
     st.subheader(
@@ -792,6 +1126,10 @@ if not df.empty:
                 "KGV (P/E)": "{:.2f}",
                 "PEG": "{:.2f}",
                 "Div. Rendite (%)": "{:.2f} %",
+                "EPS Wachstum": "{:.1%}",
+                "Umsatz Wachstum": "{:.1%}",
+                "Debt/Equity": "{:.1f}",
+                "Current Ratio": "{:.2f}",
                 "Bewertung": "{:.1f}",
                 "Wachstum": "{:.1f}",
                 "Gesundheit": "{:.1f}",
@@ -810,114 +1148,157 @@ if not df.empty:
             vmin=0,
 
             vmax=100
-
         ),
 
         use_container_width=True,
 
-        height=500
-    )
-
-
-    # ==========================================================================
-    # DATENQUALITÄT
-    # ==========================================================================
-
-    st.subheader("🔎 Datenqualität")
-
-    quality = []
-
-    for col in [
-        "KGV (P/E)",
-        "PEG",
-        "Bewertung",
-        "Wachstum",
-        "Gesundheit",
-        "Momentum"
-    ]:
-
-        available = int(
-            df[col].notna().sum()
-        )
-
-        missing = int(
-            df[col].isna().sum()
-        )
-
-        quality.append({
-
-            "Kennzahl": col,
-
-            "Daten vorhanden": available,
-
-            "Daten fehlen": missing,
-
-            "Abdeckung": (
-                f"{available / len(df) * 100:.0f}%"
-                if len(df) > 0
-                else "0%"
-            )
-        })
-
-
-    st.dataframe(
-        pd.DataFrame(quality),
-        hide_index=True,
-        use_container_width=True
-    )
-
-
-else:
-
-    st.error(
-        "❌ Es konnten keine Aktienkursdaten geladen werden."
+        height=550
     )
 
 
 # ==============================================================================
-# 12. BERECHNUNGSGRUNDLAGEN
+# 11. DIAGNOSE
 # ==============================================================================
 
 st.markdown("---")
 
 st.subheader(
-    "📐 Berechnungsgrundlagen der Scores"
+    "🧪 Yahoo-/yfinance-Diagnose"
+)
+
+st.write(
+    "Diese Tabelle zeigt, ob die verschiedenen Yahoo-Datenquellen "
+    "tatsächlich Daten liefern. Damit lässt sich das None-Problem "
+    "eindeutig lokalisieren."
+)
+
+if not diagnostics.empty:
+
+    st.dataframe(
+        diagnostics,
+        hide_index=True,
+        use_container_width=True
+    )
+
+
+# ==============================================================================
+# 12. ROHDATEN-TEST
+# ==============================================================================
+
+st.subheader(
+    "🔬 Rohdaten-Test"
+)
+
+st.caption(
+    "Zum Gegencheck wird hier beispielhaft NVDA direkt über yfinance abgefragt."
+)
+
+if "NVDA" in active_tickers:
+
+    try:
+
+        test = yf.Ticker("NVDA")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            st.write("**get_info()**")
+
+            test_info = test.get_info()
+
+            st.write({
+                "trailingPE":
+                    test_info.get("trailingPE"),
+
+                "pegRatio":
+                    test_info.get("pegRatio"),
+
+                "earningsGrowth":
+                    test_info.get("earningsGrowth"),
+
+                "revenueGrowth":
+                    test_info.get("revenueGrowth"),
+
+                "debtToEquity":
+                    test_info.get("debtToEquity"),
+
+                "currentRatio":
+                    test_info.get("currentRatio")
+            })
+
+
+        with col2:
+
+            st.write("**Valuation Measures**")
+
+            try:
+
+                test_val = test.get_valuation_measures(
+                    freq="trailing",
+                    periods=1
+                )
+
+                st.dataframe(
+                    test_val,
+                    use_container_width=True
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"Valuation-Test fehlgeschlagen: {e}"
+                )
+
+
+    except Exception as e:
+
+        st.error(
+            f"NVDA-Test fehlgeschlagen: {e}"
+        )
+
+
+# ==============================================================================
+# 13. BERECHNUNGSGRUNDLAGEN
+# ==============================================================================
+
+st.markdown("---")
+
+st.subheader(
+    "📐 Berechnungsgrundlagen"
 )
 
 col1, col2 = st.columns(2)
 
-
 with col1:
 
-    st.markdown(
-        "### 📊 Einzelscores (5–100 Punkte)"
-    )
-
     st.markdown("""
-**Bewertung (Valuation)**
+### 📊 Einzelscores
 
-* PEG < 1,0 → 100 Punkte
-* PEG 1,0–1,5 → 60 Punkte
-* PEG 1,5–2,0 → 30 Punkte
-* PEG > 2,0 → 5 Punkte
-* KGV < 15 → 100 Punkte
-* KGV 15–25 → 60 Punkte
-* KGV 25–35 → 30 Punkte
-* KGV > 35 → 5 Punkte
+**Bewertung**
+
+* PEG < 1,0 → 100
+* PEG 1,0–1,5 → 60
+* PEG 1,5–2,0 → 30
+* PEG > 2,0 → 5
+* KGV < 15 → 100
+* KGV 15–25 → 60
+* KGV 25–35 → 30
+* KGV > 35 → 5
 
 **Wachstum**
 
-* EPS-Wachstum > 20 % → 100
-* EPS-Wachstum 10–20 % → 70
-* EPS-Wachstum 0–10 % → 40
-* EPS-Wachstum < 0 % → 5
+* EPS > 20 % → 100
+* EPS 10–20 % → 70
+* EPS 0–10 % → 40
+* EPS < 0 % → 5
 
-* Umsatzwachstum > 15 % → 100
-* Umsatzwachstum 5–15 % → 60
-* Umsatzwachstum 0–5 % → 30
-* Umsatzwachstum < 0 % → 5
+* Umsatz > 15 % → 100
+* Umsatz 5–15 % → 60
+* Umsatz 0–5 % → 30
+* Umsatz < 0 % → 5
 
-**Finanzielle Gesundheit**
+**Gesundheit**
 
 * D/E < 0,5 → 100
 * D/E 0,5–1,5 → 60
@@ -929,24 +1310,17 @@ with col1:
 
 **Momentum**
 
-* Kurs über GD → 100
-* Kurs unter GD → 20
+* Kurs > GD → 100
+* Kurs < GD → 20
 * RSI 40–60 → 100
-* RSI 30–40 bzw. 60–70 → 70
-* RSI außerhalb → 20
+* RSI 30–40 / 60–70 → 70
+* sonst → 20
 """)
 
 
 with col2:
 
-    st.markdown(
-        "### 🏆 Gesamtscore-Berechnung"
-    )
-
-    st.markdown(
-        "Der Gesamtscore ist ein gewichteter Mittelwert "
-        "der verfügbaren Einzelscores."
-    )
+    st.markdown("### 🏆 Gesamtscore")
 
     st.latex(
         r"""
@@ -963,31 +1337,22 @@ with col2:
         f"""
 **Aktuelle Gewichtung**
 
-⚖️ Bewertung: **{w_val_n*100:.1f} %**
+Bewertung: **{w_val_n*100:.1f} %**
 
-🚀 Wachstum: **{w_gro_n*100:.1f} %**
+Wachstum: **{w_gro_n*100:.1f} %**
 
-🛡️ Gesundheit: **{w_hea_n*100:.1f} %**
+Gesundheit: **{w_hea_n*100:.1f} %**
 
-📈 Momentum: **{w_mom_n*100:.1f} %**
+Momentum: **{w_mom_n*100:.1f} %**
 
 ---
 
-### Bedeutung der Anzeige
+**Anzeige:**
 
-**— = Daten fehlen**
+`—` = Daten fehlen
 
-**5 = Daten vorhanden, aber schlechtester Score**
+`5` = Daten vorhanden, schlechtester Score
 
-Damit ist eindeutig erkennbar, ob ein Titel tatsächlich
-schlecht bewertet wird oder ob Yahoo die notwendige
-Kennzahl nicht liefert.
-
-Fehlt beispielsweise das PEG, wird der Valuation-Score
-nur aus dem vorhandenen KGV berechnet.
-
-Fehlen sämtliche Bewertungsdaten, bleibt der
-Valuation-Score **—** und wird beim Gesamtscore
-nicht berücksichtigt.
+`100` = maximaler Score
 """
     )
