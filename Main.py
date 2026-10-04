@@ -2023,6 +2023,11 @@ def extract_metrics(data):
             )
         )
 
+    # yfinance does not always provide a mean target even when a median
+    # analyst target exists. The median is a valid fallback for Fair Value.
+    if pd.isna(analyst_target_mean) and pd.notna(analyst_target_median):
+        analyst_target_mean = analyst_target_median
+
     if pd.isna(analyst_target_median):
         analyst_target_median = clean_positive(
             safe_get(
@@ -2429,10 +2434,12 @@ INVESTMENT_THRESHOLDS = {
 }
 
 
+MIN_VALID_SCORE = 5.0
+
 def clip_score(value):
     if pd.isna(value):
         return np.nan
-    return float(np.clip(value, 0.0, 100.0))
+    return float(np.clip(value, MIN_VALID_SCORE, 100.0))
 
 
 def weighted_available(components):
@@ -2967,7 +2974,7 @@ def style_results_table(df):
             'Technical': '{:.0f}',
             'Forward-KGV': '{:.1f}',
             'Datenvollständigkeit (%)': '{:.0f}%'
-        })
+        }, na_rep='—')
     )
     return styler
 
@@ -3137,6 +3144,7 @@ if st.button("🚀 Aktien analysieren"):
     results_df = results_df.sort_values('Investment Score', ascending=False, na_position='last')
 
     st.subheader("📋 Ergebnisse")
+    st.caption("Score 5 = echter, aber sehr schwacher Score. — = Daten/Berechnung nicht verfügbar.")
     st.dataframe(style_results_table(results_df), use_container_width=True, hide_index=True)
 
     st.subheader("🧮 V20.0 Score-Analyse")
@@ -3191,7 +3199,11 @@ if st.button("🚀 Aktien analysieren"):
         })
 
         detail_table['Score'] = detail_table['Score'].round(1)
-        st.dataframe(detail_table, use_container_width=True, hide_index=True)
+        st.dataframe(
+            detail_table.style.format({'Score': '{:.1f}'}, na_rep='—'),
+            use_container_width=True,
+            hide_index=True
+        )
 
         st.markdown("#### 📐 Berechnung")
         st.code(
