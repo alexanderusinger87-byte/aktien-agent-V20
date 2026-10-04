@@ -682,6 +682,30 @@ def fetch_stock_data(ticker_symbol):
             except Exception:
                 cashflow = pd.DataFrame()
 
+        # TTM data is used by the Fair-Value engine. It is deliberately
+        # fetched separately from the annual statements so that the model
+        # does not value a company using an outdated fiscal year.
+        try:
+            ttm_income_stmt = ticker.ttm_income_stmt
+        except Exception:
+            try:
+                ttm_income_stmt = ticker.get_income_stmt(freq="trailing")
+            except Exception:
+                ttm_income_stmt = pd.DataFrame()
+
+        try:
+            ttm_cashflow = ticker.ttm_cashflow
+        except Exception:
+            try:
+                ttm_cashflow = ticker.get_cashflow(freq="trailing")
+            except Exception:
+                ttm_cashflow = pd.DataFrame()
+
+        try:
+            quarterly_balance_sheet = ticker.get_balance_sheet(freq="quarterly")
+        except Exception:
+            quarterly_balance_sheet = pd.DataFrame()
+
         return {
 
             'ticker': ticker_symbol,
@@ -695,7 +719,10 @@ def fetch_stock_data(ticker_symbol):
             'hist': hist,
             'financials': financials,
             'balance_sheet': balance_sheet,
-            'cashflow': cashflow
+            'cashflow': cashflow,
+            'ttm_income_stmt': ttm_income_stmt,
+            'ttm_cashflow': ttm_cashflow,
+            'quarterly_balance_sheet': quarterly_balance_sheet
         }
 
     except Exception:
@@ -1108,217 +1135,219 @@ def get_free_cash_flow(cashflow):
 # FAIR VALUE MODEL
 # ============================================================
 
-def calculate_fcf_fair_value(
-    fcf,
-    market_cap,
-    current_price,
-    growth_rate
+# The Fair-Value engine intentionally uses several independent valuation
+# anchors. Missing data removes only that model; it never creates a score of 0.
+#
+# Non-financial companies:
+#   50% Earnings FV = Forward EPS * Fair P/E
+#   30% FCF FV      = TTM FCF/share / target FCF yield
+#   20% Analyst FV  = median target (mean fallback)
+#
+# Financial Services:
+#   45% P/B / ROE justified value
+#   35% Earnings FV
+#   20% Analyst FV
+
+
+def _first_numeric_value(value):
+    """Return the first finite numeric scalar from a scalar/Series/list."""
+    if isinstance(value, pd.Series):
+        vals = pd.to_numeric(value, errors='coerce').dropna()
+        return float(vals.iloc[0]) if not vals.empty else np.nan
+    if isinstance(value, (list, tuple, np.ndarray)):
+        vals = pd.to_numeric(pd.Series(value), errors='coerce').dropna()
+        return float(vals.iloc[0]) if not vals.empty else np.nan
+    return to_number(value)
+
+
+def _statement_value(df, keys):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return np.nan
+    return get_first_valid_row(df, keys)
+
+
+def get_ttm_free_cash_flow(ttm_cashflow, fallback_cashflow=None):
+    """Extract TTM FCF, preferring Yahoo's direct FCF field."""
+    fcf_keys = [
+        'Free Cash Flow', 'FreeCashFlow', 'Free Cashflow', 'FreeCashflow'
+    ]
+    ocf_keys = [
+        'Operating Cash Flow', 'Total Cash From Operating Activities',
+        'Cash Flow From Continuing Operating Activities', 'OperatingCashFlow'
+    ]
+    capex_keys = [
+        'Capital Expenditure', 'Capital Expenditures', 'CapitalExpenditures',
+        'CapEx', 'Purchase Of Property And Equipment'
+    ]
+
+    fcf = _statement_value(ttm_cashflow, fcf_keys)
+    if pd.notna(fcf) and fcf != 0:
+        return fcf
+
+    ocf = _statement_value(ttm_cashflow, ocf_keys)
+    capex = _statement_value(ttm_cashflow, capex_keys)
+    if pd.notna(ocf) and pd.notna(capex):
+        return ocf + capex if capex < 0 else ocf - capex
+
+    # Fallback to the latest annual value only when TTM is unavailable.
+    if fallback_cashflow is not None:
+        return get_free_cash_flow(fallback_cashflow)
+    return np.nan
+
+
+def get_ttm_net_income(ttm_income_stmt, fallback_financials=None):
+    keys = [
+        'Net Income', 'Net Income Common Stockholders',
+        'NetIncome', 'NetIncomeCommonStockholders'
+    ]
+    value = _statement_value(ttm_income_stmt, keys)
+    if pd.notna(value):
+        return value
+    if fallback_financials is not None:
+        return _statement_value(fallback_financials, keys)
+    return np.nan
+
+
+def calculate_earnings_fair_value(forward_eps, earnings_growth):
+    """Forward EPS multiplied by a growth-derived, bounded fair P/E."""
+    if pd.isna(forward_eps) or forward_eps <= 0:
+        return np.nan, np.nan
+
+    if pd.isna(earnings_growth):
+        return np.nan, np.nan
+
+    growth_pct = float(earnings_growth) * 100.0
+    fair_pe = float(np.clip(10.0 + 0.40 * growth_pct, 10.0, 28.0))
+    fair_value = forward_eps * fair_pe
+
+    if not np.isfinite(fair_value) or fair_value <= 0:
+        return np.nan, fair_pe
+    return fair_value, fair_pe
+
+
+def calculate_fcf_fair_value_ttm(
+    ttm_fcf,
+    shares_outstanding,
+    earnings_growth,
+    beta=np.nan
 ):
-
+    """TTM FCF/share valued at a growth/risk-adjusted target FCF yield."""
     if (
-        pd.isna(fcf)
-        or fcf <= 0
-        or pd.isna(market_cap)
-        or market_cap <= 0
-        or pd.isna(current_price)
-        or current_price <= 0
+        pd.isna(ttm_fcf) or ttm_fcf <= 0
+        or pd.isna(shares_outstanding) or shares_outstanding <= 0
     ):
-        return np.nan
+        return np.nan, np.nan
 
-    fcf_yield = (
-        fcf / market_cap
-    )
+    fcf_per_share = ttm_fcf / shares_outstanding
+    if not np.isfinite(fcf_per_share) or fcf_per_share <= 0:
+        return np.nan, np.nan
 
+    growth_pct = 5.0 if pd.isna(earnings_growth) else float(earnings_growth) * 100.0
+    growth_for_yield = np.clip(growth_pct, -5.0, 30.0)
+
+    # 8.0% at 0% growth, declining to ~3.5% at 30% growth.
+    target_yield = 0.08 - 0.0015 * growth_for_yield
+
+    # Small risk adjustment; beta is never allowed to dominate valuation.
+    if pd.notna(beta) and beta > 0:
+        target_yield += 0.005 * (float(beta) - 1.0)
+
+    target_yield = float(np.clip(target_yield, 0.035, 0.10))
+    fair_value = fcf_per_share / target_yield
+
+    if not np.isfinite(fair_value) or fair_value <= 0:
+        return np.nan, target_yield
+    return fair_value, target_yield
+
+
+def calculate_bank_fair_value(
+    equity,
+    shares_outstanding,
+    roe,
+    growth_rate,
+    beta=np.nan
+):
+    """Justified P/B valuation for banks/financial services."""
     if (
-        pd.isna(fcf_yield)
-        or fcf_yield <= 0
-        or fcf_yield > 0.50
+        pd.isna(equity) or equity <= 0
+        or pd.isna(shares_outstanding) or shares_outstanding <= 0
+        or pd.isna(roe) or roe <= 0
     ):
-        return np.nan
+        return np.nan, np.nan, np.nan
 
-    fcf_per_share = (
-        fcf_yield
-        * current_price
-    )
+    bvps = equity / shares_outstanding
 
-    if (
-        pd.isna(fcf_per_share)
-        or fcf_per_share <= 0
-    ):
-        return np.nan
+    # Cost of equity: CAPM-style assumption. Ke is bounded to avoid
+    # pathological P/B values when Yahoo beta is missing/extreme.
+    beta_value = 1.0 if pd.isna(beta) or beta <= 0 else float(beta)
+    ke = float(np.clip(0.04 + beta_value * 0.055, 0.07, 0.14))
 
-    if pd.isna(growth_rate):
-        growth_rate = 0.05
+    g = 0.02 if pd.isna(growth_rate) else float(growth_rate)
+    g = float(np.clip(g, 0.0, ke - 0.01))
 
-    growth_rate = np.clip(
-        growth_rate,
-        -0.03,
-        0.12
-    )
+    if ke <= g:
+        return np.nan, np.nan, bvps
 
-    discount_rate = 0.09
-    terminal_growth = 0.025
+    justified_pb = (roe - g) / (ke - g)
+    justified_pb = float(np.clip(justified_pb, 0.50, 3.50))
+    fair_value = bvps * justified_pb
 
-    if terminal_growth >= discount_rate:
-        return np.nan
-
-    pv_fcf = 0.0
-    projected_fcf = fcf_per_share
-
-    for year in range(1, 6):
-
-        year_growth = (
-            growth_rate
-            + (
-                terminal_growth
-                - growth_rate
-            )
-            * (year - 1)
-            / 4
-        )
-
-        projected_fcf *= (
-            1 + year_growth
-        )
-
-        pv_fcf += (
-            projected_fcf
-            / (
-                (1 + discount_rate)
-                ** year
-            )
-        )
-
-    terminal_value = (
-        projected_fcf
-        * (1 + terminal_growth)
-        / (
-            discount_rate
-            - terminal_growth
-        )
-    )
-
-    pv_terminal = (
-        terminal_value
-        / (
-            (1 + discount_rate)
-            ** 5
-        )
-    )
-
-    fair_value = (
-        pv_fcf
-        + pv_terminal
-    )
-
-    if (
-        pd.isna(fair_value)
-        or fair_value <= 0
-        or fair_value > current_price * 10
-        or fair_value < current_price * 0.05
-    ):
-        return np.nan
-
-    dcf_lower_bound = current_price * 0.60
-    dcf_upper_bound = current_price * 1.75
-
-    if (
-        fair_value < dcf_lower_bound
-        or fair_value > dcf_upper_bound
-    ):
-        return np.nan
-
-    return fair_value
+    if not np.isfinite(fair_value) or fair_value <= 0:
+        return np.nan, justified_pb, bvps
+    return fair_value, justified_pb, bvps
 
 
 def calculate_fair_value_score(
     current_price,
-    analyst_target,
-    fcf_fair_value
+    earnings_fair_value=np.nan,
+    fcf_fair_value=np.nan,
+    analyst_target=np.nan,
+    bank_fair_value=np.nan,
+    is_financial=False
 ):
+    """Return composite FV, score, upside, model list and data quality."""
+    if pd.isna(current_price) or current_price <= 0:
+        return np.nan, np.nan, np.nan, '', 'Keine Daten'
 
-    fair_values = []
-
-    if (
-        pd.notna(analyst_target)
-        and analyst_target > 0
-    ):
-        fair_values.append(
-            ('analyst', analyst_target)
-        )
-
-    if (
-        pd.notna(fcf_fair_value)
-        and fcf_fair_value > 0
-    ):
-        fair_values.append(
-            ('fcf', fcf_fair_value)
-        )
-
-    if not fair_values:
-        return np.nan, np.nan
-
-    if len(fair_values) == 2:
-
-        analyst_value = next(
-            value
-            for source, value in fair_values
-            if source == 'analyst'
-        )
-
-        fcf_value = next(
-            value
-            for source, value in fair_values
-            if source == 'fcf'
-        )
-
-        fair_value_price = (
-            0.75 * analyst_value
-            + 0.25 * fcf_value
-        )
-
+    if is_financial:
+        candidates = [
+            ('P/B', bank_fair_value, 0.45),
+            ('Earnings', earnings_fair_value, 0.35),
+            ('Analyst', analyst_target, 0.20),
+        ]
     else:
+        candidates = [
+            ('Earnings', earnings_fair_value, 0.50),
+            ('FCF', fcf_fair_value, 0.30),
+            ('Analyst', analyst_target, 0.20),
+        ]
 
-        fair_value_price = fair_values[0][1]
+    available = [
+        (name, float(value), weight)
+        for name, value, weight in candidates
+        if pd.notna(value) and np.isfinite(value) and value > 0
+    ]
 
-    if (
-        pd.isna(current_price)
-        or current_price <= 0
-    ):
-        return fair_value_price, np.nan
+    if not available:
+        return np.nan, np.nan, np.nan, '', 'Keine Daten'
 
-    upside = (
-        fair_value_price
-        / current_price
-        - 1
-    )
+    total_weight = sum(weight for _, _, weight in available)
+    fair_value = sum(value * weight for _, value, weight in available) / total_weight
 
+    upside = fair_value / current_price - 1.0
+
+    # A valid but very unattractive valuation is a low score, never 0.
     fair_value_score = np.interp(
         upside,
-        [
-            -0.40,
-            -0.20,
-            0.00,
-            0.10,
-            0.25,
-            0.50,
-            0.75
-        ],
-        [
-            0,
-            15,
-            40,
-            58,
-            75,
-            90,
-            100
-        ]
+        [-0.40, -0.20, 0.00, 0.10, 0.25, 0.50, 0.75],
+        [5.0, 15.0, 40.0, 58.0, 75.0, 90.0, 100.0]
     )
+    fair_value_score = float(np.clip(fair_value_score, 5.0, 100.0))
 
-    return (
-        fair_value_price,
-        fair_value_score
-    )
+    models = ' | '.join(f'{name} ✓' for name, _, _ in available)
+    quality = {1: 'Niedrig', 2: 'Mittel', 3: 'Hoch'}.get(len(available), 'Keine Daten')
+
+    return fair_value, fair_value_score, upside, models, quality
 
 
 # ============================================================
@@ -1448,6 +1477,9 @@ def extract_metrics(data):
     financials = data['financials']
     balance_sheet = data['balance_sheet']
     cashflow = data['cashflow']
+    ttm_income_stmt = data.get('ttm_income_stmt', pd.DataFrame())
+    ttm_cashflow = data.get('ttm_cashflow', pd.DataFrame())
+    quarterly_balance_sheet = data.get('quarterly_balance_sheet', pd.DataFrame())
 
     ticker_symbol = data['ticker']
 
@@ -1540,6 +1572,17 @@ def extract_metrics(data):
         ]
     )
 
+    if pd.isna(equity):
+        equity = get_row(
+            quarterly_balance_sheet,
+            [
+                'Stockholders Equity',
+                'Total Equity Gross Minority Interest',
+                'Common Stock Equity',
+                'StockholdersEquity'
+            ]
+        )
+
     current_assets = get_row(
         balance_sheet,
         [
@@ -1562,6 +1605,13 @@ def extract_metrics(data):
             'forwardEps'
         )
     )
+
+    if pd.isna(forward_eps):
+        forward_eps = get_estimate_value(
+            earnings_estimate,
+            '+1y',
+            'avg'
+        )
 
     earnings_growth = clean_percentage(
         safe_get(
@@ -2052,58 +2102,62 @@ def extract_metrics(data):
             )
         )
 
-    growth_inputs = []
+    beta = clean_positive(safe_get(info, 'beta'))
 
-    if pd.notna(revenue_growth):
-        growth_inputs.append(
-            (revenue_growth, 0.60)
+    # --------------------------------------------------------
+    # NEW FAIR VALUE ENGINE
+    # --------------------------------------------------------
+    # Growth is used only for the earnings multiple / FCF yield.
+    # Revenue growth is deliberately not mixed into an FCF valuation.
+    earnings_fair_value, fair_pe = calculate_earnings_fair_value(
+        forward_eps,
+        earnings_growth
+    )
+
+    ttm_fcf = get_ttm_free_cash_flow(
+        ttm_cashflow,
+        cashflow
+    )
+
+    fcf_fair_value, target_fcf_yield = calculate_fcf_fair_value_ttm(
+        ttm_fcf,
+        shares_outstanding,
+        earnings_growth,
+        beta
+    )
+
+    # Median is preferred because one extreme analyst target should not
+    # dominate the composite. Mean remains the fallback.
+    analyst_fair_value = analyst_target_median
+    if pd.isna(analyst_fair_value):
+        analyst_fair_value = analyst_target_mean
+
+    bank_fair_value = np.nan
+    justified_pb = np.nan
+    bvps = np.nan
+
+    if sector == 'Financial Services':
+        bank_fair_value, justified_pb, bvps = calculate_bank_fair_value(
+            equity,
+            shares_outstanding,
+            roe,
+            long_term_growth,
+            beta
         )
 
-    if pd.notna(earnings_growth):
-        growth_inputs.append(
-            (earnings_growth, 0.40)
-        )
-
-    if growth_inputs:
-
-        weighted_growth = (
-            sum(
-                value * weight
-                for value, weight in growth_inputs
-            )
-            / sum(
-                weight
-                for _, weight in growth_inputs
-            )
-        )
-
-        dcf_growth = np.clip(
-            weighted_growth,
-            -0.03,
-            0.12
-        )
-
-    else:
-
-        dcf_growth = 0.05
-
-    fcf_fair_value = np.nan
-
-    if sector != 'Financial Services':
-
-        fcf_fair_value = calculate_fcf_fair_value(
-            fcf,
-            market_cap,
-            current_price,
-            dcf_growth
-        )
-
-    fair_value_price, fair_value_score = (
-        calculate_fair_value_score(
-            current_price,
-            analyst_target_mean,
-            fcf_fair_value
-        )
+    (
+        fair_value_price,
+        fair_value_score,
+        fair_value_upside,
+        fair_value_models,
+        fair_value_data_quality
+    ) = calculate_fair_value_score(
+        current_price,
+        earnings_fair_value=earnings_fair_value,
+        fcf_fair_value=fcf_fair_value,
+        analyst_target=analyst_fair_value,
+        bank_fair_value=bank_fair_value,
+        is_financial=(sector == 'Financial Services')
     )
 
     analyst_target_upside = np.nan
@@ -2116,20 +2170,6 @@ def extract_metrics(data):
 
         analyst_target_upside = (
             analyst_target_mean
-            / current_price
-            - 1
-        )
-
-    fair_value_upside = np.nan
-
-    if (
-        pd.notna(fair_value_price)
-        and pd.notna(current_price)
-        and current_price > 0
-    ):
-
-        fair_value_upside = (
-            fair_value_price
             / current_price
             - 1
         )
@@ -2384,10 +2424,19 @@ def extract_metrics(data):
         'analyst_target_high': analyst_target_high,
         'analyst_target_upside': analyst_target_upside,
 
+        'ttm_fcf': ttm_fcf,
+        'earnings_fair_value': earnings_fair_value,
+        'fair_pe': fair_pe,
         'fcf_fair_value': fcf_fair_value,
+        'target_fcf_yield': target_fcf_yield,
+        'bank_fair_value': bank_fair_value,
+        'justified_pb': justified_pb,
+        'bvps': bvps,
         'fair_value_price': fair_value_price,
         'fair_value_upside': fair_value_upside,
         'fair_value_score': fair_value_score,
+        'fair_value_models': fair_value_models,
+        'fair_value_data_quality': fair_value_data_quality,
 
         'sma50': sma50,
         'sma200': sma200,
@@ -3257,17 +3306,79 @@ und die lineare Score-Transformation:
 
     with st.expander("4. Fair Value Score – absolute Preisattraktivität"):
         st.markdown("""
-Der Fair-Value-Score wird aus dem bereits berechneten Fair Value relativ zum aktuellen Aktienkurs abgeleitet.
+Der Fair-Value-Score basiert jetzt auf mehreren möglichst unabhängigen Bewertungsmodellen. Fehlende Daten werden **nicht** als 0 gewertet: Das betreffende Modell fällt weg und die Gewichte der verfügbaren Modelle werden neu normiert.
+
+### Normale Unternehmen
+
+**1. Earnings Fair Value – 50 %**
 
 \[
-Upside = \frac{FairValue}{CurrentPrice}-1
+FairPE = clamp(10 + 0{,}40\cdot EPSGrowth_{\%},\ 10,\ 28)
 \]
 
-Danach erfolgt eine lineare Interpolation:
+\[
+FV_{Earnings}=ForwardEPS\cdot FairPE
+\]
+
+**2. FCF Fair Value – 30 %**
+
+Es wird das **TTM-Free-Cash-Flow** verwendet:
+
+\[
+FCF/share=\frac{TTM\ FCF}{SharesOutstanding}
+\]
+
+Die Zielrendite wird aus Wachstum und Risiko abgeleitet:
+
+\[
+TargetFCFYield=8\%-0{,}15\cdot Growth_{\%}
+\]
+
+mit Begrenzung auf 3,5–10 %. Zusätzlich erfolgt eine kleine Beta-Anpassung.
+
+\[
+FV_{FCF}=\frac{FCF/share}{TargetFCFYield}
+\]
+
+**3. Analystenkonsens – 20 %**
+
+Bevorzugt wird der Median des Analystenziels, alternativ der Mittelwert.
+
+\[
+FV_{Analyst}=Median(AnalystTargets)
+\]
+
+Gesamtwert:
+
+\[
+FV=\frac{\sum FV_i\cdot w_i}{\sum w_i}
+\]
+
+Die Gewichte werden ausschließlich über tatsächlich verfügbare Modelle normiert.
+
+### Finanzwerte
+
+Für Banken/Financial Services wird zusätzlich ein ROE-/Buchwert-Modell verwendet:
+
+\[
+FV_{P/B}=BVPS\cdot FairP/B
+\]
+
+\[
+FairP/B=\frac{ROE-g}{K_e-g}
+\]
+
+mit CAPM-artigem Cost of Equity, begrenzt auf 7–14 %. Für Finanzwerte gelten anschließend 45 % P/B, 35 % Earnings und 20 % Analystenkonsens.
+
+### Fair-Value-Score
+
+\[
+Upside=\frac{FairValue}{CurrentPrice}-1
+\]
 
 | Upside | Score |
 |---:|---:|
-| −40 % | 0 → intern auf mindestens 5 begrenzt |
+| −40 % | 5 |
 | −20 % | 15 |
 | 0 % | 40 |
 | +10 % | 58 |
@@ -3275,55 +3386,9 @@ Danach erfolgt eine lineare Interpolation:
 | +50 % | 90 |
 | +75 % | 100 |
 
-**Wichtig:** Ein berechneter, aber extrem schlechter Wert ist damit ein echter niedriger Score. Fehlen dagegen sämtliche Fair-Value-Daten, bleibt der Wert `None/—`.
+Der Score wird auf **5–100** begrenzt. Deshalb bedeutet `5` einen tatsächlich berechneten, sehr unattraktiven Fair Value; `None/—` bedeutet dagegen, dass keine belastbare Bewertungsquelle vorhanden ist.
 
-Die eigentliche V20.0-Fair-Value-Berechnung verwendet aktuell zwei mögliche Quellen:
-
-\[
-FairValue = 0{,}75\cdot AnalystTarget + 0{,}25\cdot FCF\text{-}FairValue
-\]
-
-wenn beide Quellen vorhanden sind. Ist nur eine Quelle vorhanden, wird diese allein verwendet.
-
-### FCF-DCF
-
-Zunächst:
-
-\[
-FCFYield = \frac{FCF}{MarketCap}
-\]
-
-\[
-FCF/share = FCFYield\cdot CurrentPrice
-\]
-
-Das FCF wird fünf Jahre projiziert. Das jährliche Wachstum wird dabei linear vom Startwachstum zum Terminalwachstum von 2,5 % zurückgeführt.
-
-\[
-FCF_t = FCF_{t-1}\cdot(1+g_t)
-\]
-
-\[
-PV(FCF_t)=\frac{FCF_t}{(1+r)^t}
-\]
-
-Terminal Value:
-
-\[
-TV=\frac{FCF_5\cdot(1+g_{terminal})}{r-g_{terminal}}
-\]
-
-\[
-FairValue_{DCF}=\sum_{t=1}^{5}PV(FCF_t)+PV(TV)
-\]
-
-Aktuelle Modellparameter:
-- Diskontsatz \(r = 9\%\)
-- Terminal Growth \(g_{terminal}=2{,}5\%\)
-- Prognosezeitraum = 5 Jahre
-- Startwachstum wird auf −3 % bis +12 % begrenzt.
-
-Zusätzlich verwirft der aktuelle Code DCF-Werte außerhalb von **60 % bis 175 % des aktuellen Aktienkurses**. Das ist eine Plausibilitätsbremse und keine mathematische Eigenschaft eines DCF.
+Zusätzlich werden intern die verwendeten Modelle und die Datenqualität (`Hoch / Mittel / Niedrig`) gespeichert.
         """)
 
     with st.expander("5. Relative Valuation Score"):
@@ -3454,7 +3519,7 @@ Damit bleibt die fundamentale Investmentbewertung unabhängig von kurzfristiger 
         """)
 
     st.info(
-        "Hinweis: Dieser Bereich dokumentiert bewusst die Mathematik des aktuellen V20.0-Modells. "
+        "Hinweis: Dieser Bereich dokumentiert die Mathematik des aktuellen V20.0-Modells inklusive des neuen Multi-Model-Fair-Value-Engines. "
         "Er verändert keine Scores und keine Datenbeschaffung. Die Fair-Value-Methodik selbst können wir "
         "im nächsten Schritt separat mathematisch verbessern."
     )
