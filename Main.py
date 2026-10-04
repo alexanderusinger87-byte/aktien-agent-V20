@@ -43,17 +43,17 @@ def calculate_individual_scores(info, hist):
     """Berechnet die 4 Einzelscores (0 bis 100 Punkte) basierend auf Fundamental- und Technikdaten."""
     
     # 1. VALUATION SCORE
-    pe = info.get("trailingPE", None)
-    peg = info.get("pegRatio", None)
+    pe = info.get("trailingPE", None) if info else None
+    peg = info.get("pegRatio", None) if info else None
     
     val_points = []
-    if peg and peg > 0:
+    if peg and isinstance(peg, (int, float)) and peg > 0:
         if peg < 1.0: val_points.append(100)
         elif peg <= 1.5: val_points.append(60)
         elif peg <= 2.0: val_points.append(30)
         else: val_points.append(0)
         
-    if pe and pe > 0:
+    if pe and isinstance(pe, (int, float)) and pe > 0:
         if pe < 15: val_points.append(100)
         elif pe <= 25: val_points.append(60)
         elif pe <= 35: val_points.append(30)
@@ -62,17 +62,17 @@ def calculate_individual_scores(info, hist):
     valuation_score = np.mean(val_points) if val_points else np.nan
 
     # 2. GROWTH SCORE
-    earnings_growth = info.get("earningsGrowth", None)
-    revenue_growth = info.get("revenueGrowth", None)
+    earnings_growth = info.get("earningsGrowth", None) if info else None
+    revenue_growth = info.get("revenueGrowth", None) if info else None
     
     growth_points = []
-    if earnings_growth is not None:
+    if earnings_growth is not None and isinstance(earnings_growth, (int, float)):
         if earnings_growth > 0.20: growth_points.append(100)
         elif earnings_growth > 0.10: growth_points.append(70)
         elif earnings_growth > 0: growth_points.append(40)
         else: growth_points.append(0)
         
-    if revenue_growth is not None:
+    if revenue_growth is not None and isinstance(revenue_growth, (int, float)):
         if revenue_growth > 0.15: growth_points.append(100)
         elif revenue_growth > 0.05: growth_points.append(60)
         elif revenue_growth > 0: growth_points.append(30)
@@ -81,33 +81,34 @@ def calculate_individual_scores(info, hist):
     growth_score = np.mean(growth_points) if growth_points else np.nan
 
     # 3. FINANCIAL HEALTH SCORE
-    debt_to_equity = info.get("debtToEquity", None)
-    current_ratio = info.get("currentRatio", None)
+    debt_to_equity = info.get("debtToEquity", None) if info else None
+    current_ratio = info.get("currentRatio", None) if info else None
     
     health_points = []
-    if debt_to_equity is not None:
-        # yfinance liefert debtToEquity meist als Prozentwert (z.B. 50 für 0.5)
+    if debt_to_equity is not None and isinstance(debt_to_equity, (int, float)):
         de_val = debt_to_equity / 100.0 if debt_to_equity > 10 else debt_to_equity
         if de_val < 0.5: health_points.append(100)
         elif de_val <= 1.5: health_points.append(60)
         else: health_points.append(10)
         
-    if current_ratio is not None:
+    if current_ratio is not None and isinstance(current_ratio, (int, float)):
         if current_ratio > 1.5: health_points.append(100)
         elif current_ratio >= 1.0: health_points.append(50)
         else: health_points.append(0)
         
     health_score = np.mean(health_points) if health_points else np.nan
 
-    # 4. MOMENTUM / TECHNIK SCORE
+    # 4. MOMENTUM / TECHNIK SCORE (funktioniert auch ohne info-Daten!)
     tech_points = []
-    if len(hist) >= 200:
+    if hist is not None and not hist.empty and len(hist) >= 50:
         close_prices = hist["Close"]
         current_price = close_prices.iloc[-1]
-        sma_200 = close_prices.rolling(window=200).mean().iloc[-1]
+        
+        window = min(200, len(close_prices))
+        sma = close_prices.rolling(window=window).mean().iloc[-1]
         rsi = calc_rsi(close_prices)
         
-        if current_price > sma_200:
+        if current_price > sma:
             tech_points.append(100)
         else:
             tech_points.append(20)
@@ -128,31 +129,53 @@ def calculate_individual_scores(info, hist):
 
 @st.cache_data(ttl=3600)
 def fetch_screener_data(tickers):
-    """Ruft Daten von yfinance ab und berechnet alle Kennzahlen sowie Scores."""
+    """Ruft Daten von yfinance mit Fehlertoleranz ab."""
     data = []
     
-    for symbol in tickers:
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total_tickers = len(tickers)
+    for idx, symbol in enumerate(tickers):
+        status_text.text(f"Lade Daten für {symbol} ({idx+1}/{total_tickers})...")
+        progress_bar.progress((idx + 1) / total_tickers)
+        
         try:
             ticker = yf.Ticker(symbol)
-            info = ticker.info
             hist = ticker.history(period="1y")
             
             if hist.empty:
                 continue
-                
+            
+            # Versuche info abzurufen, falls Yahoo blockt -> Fallback auf leeres Dict
+            try:
+                info = ticker.info
+                if not isinstance(info, dict):
+                    info = {}
+            except Exception:
+                info = {}
+
+            # Kursermittlung
+            current_price = np.nan
+            if hasattr(ticker, "fast_info") and "lastPrice" in ticker.fast_info:
+                current_price = ticker.fast_info["lastPrice"]
+            if np.isnan(current_price) or current_price is None:
+                current_price = hist["Close"].iloc[-1]
+
             scores = calculate_individual_scores(info, hist)
             
-            current_price = info.get("currentPrice", hist["Close"].iloc[-1])
             pe = info.get("trailingPE", np.nan)
             peg = info.get("pegRatio", np.nan)
             div_yield = info.get("dividendYield", 0)
-            if div_yield:
+            if div_yield and isinstance(div_yield, (int, float)):
                 div_yield *= 100
-                
+            else:
+                div_yield = 0.0
+
             data.append({
                 "Symbol": symbol,
-                "Name": info.get("shortName", symbol),
-                "Sektor": info.get("sector", "N/A"),
+                "Name": info.get("shortName", symbol) if info else symbol,
+                "Sektor": info.get("sector", "N/A") if info else "N/A",
                 "Kurs": current_price,
                 "KGV (P/E)": pe,
                 "PEG": peg,
@@ -165,6 +188,9 @@ def fetch_screener_data(tickers):
         except Exception:
             continue
             
+    progress_bar.empty()
+    status_text.empty()
+    
     return pd.DataFrame(data)
 
 # ==============================================================================
@@ -193,12 +219,11 @@ else:
     w_val_n = w_gro_n = w_hea_n = w_mom_n = 0.25
 
 # ==============================================================================
-# 4. TAZEN- & TABELLEN-DARSTELLUNG
+# 4. TABELLEN-DARSTELLUNG
 # ==============================================================================
 df = fetch_screener_data(active_tickers)
 
 if not df.empty:
-    # Gesamtscore dynamisch aus den vom Nutzer gewählten Gewichten berechnen
     def compute_total_score(row):
         scores = []
         weights = []
@@ -220,16 +245,13 @@ if not df.empty:
         return np.average(scores, weights=weights)
 
     df["Gesamtscore"] = df.apply(compute_total_score, axis=1)
-    
-    # Sortierung standardmäßig nach Gesamtscore
     df = df.sort_values(by="Gesamtscore", ascending=False).reset_index(drop=True)
     
-    # Tabelle anzeigen
     st.subheader("📋 Aktienübersicht & Scoring")
     
     st.dataframe(
         df.style.format({
-            "Kurs": "{:.2f} €",
+            "Kurs": "{:.2f}",
             "KGV (P/E)": "{:.2f}",
             "PEG": "{:.2f}",
             "Div. Rendite (%)": "{:.2f} %",
@@ -243,7 +265,7 @@ if not df.empty:
         height=500
     )
 else:
-    st.warning("Keine Daten für die ausgewählten Ticker gefunden.")
+    st.warning("Keine Daten für die ausgewählten Ticker gefunden. Bitte prüfe die Internetverbindung oder verringere die Anzahl der Ticker.")
 
 # ==============================================================================
 # 5. DOKUMENTATION & BERECHNUNGSGRUNDLAGEN (UNTEN IM SCREENER)
