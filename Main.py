@@ -11,28 +11,27 @@ import time
 # ============================================================
 
 st.set_page_config(
-    page_title="Aktien-Screener V20.4",
+    page_title="Aktien-Screener V21.0",
     page_icon="📊",
     layout="wide"
 )
 
 
 # ============================================================
-# CONSTANTS
+# VERSION
 # ============================================================
 
-MIN_VALID_SCORE = 5.0
-MAX_SCORE = 100.0
+VERSION = "V21.0"
+
+
+# ============================================================
+# INITIAL SCORE WEIGHTS
+# ============================================================
 
 INITIAL_SCORE_WEIGHTS = {
     "kpax": 0.45,
     "kpax_fv": 0.45,
     "risk": 0.10
-}
-
-INITIAL_KPAX_FV_WEIGHTS = {
-    "fair_value": 0.55,
-    "relative_valuation": 0.45
 }
 
 
@@ -85,34 +84,40 @@ TICKERS = [
 # ============================================================
 
 FALLBACK_SECTORS = {
-    "Technology": [
-        "GOOGL", "NVDA", "AAPL", "MU", "INTC",
-        "ASML", "TSM", "MRVL", "000660.KS",
-        "005930.KS", "AMD", "MSFT", "AVGO",
-        "IFX.DE", "NOK", "VRT", "1810.HK",
-        "F8P", "SSUN.F"
-    ],
-    "Consumer Cyclical": [
+
+    "Technology": {
+        "GOOGL", "NVDA", "AAPL", "MU", "INTC", "ASML", "TSM",
+        "MRVL", "000660.KS", "005930.KS", "AMD", "MSFT", "AVGO",
+        "IFX.DE", "NOK", "VRT", "1810.HK", "F8P", "SSUN.F"
+    },
+
+    "Consumer Cyclical": {
         "AMZN", "BMW.DE", "NKE", "TSLA", "MCD", "ADS.DE"
-    ],
-    "Consumer Defensive": [
+    },
+
+    "Consumer Defensive": {
         "PEP", "KO"
-    ],
-    "Healthcare": [
+    },
+
+    "Healthcare": {
         "NVO"
-    ],
-    "Energy": [
+    },
+
+    "Energy": {
         "SU.PA"
-    ],
-    "Utilities": [
+    },
+
+    "Utilities": {
         "VST"
-    ],
-    "Industrials": [
+    },
+
+    "Industrials": {
         "SMO", "ENR.DE", "SIE.DE"
-    ],
-    "Financial Services": [
+    },
+
+    "Financial Services": {
         "MUV2.DE", "ALV.DE", "MAIR"
-    ]
+    }
 }
 
 
@@ -123,356 +128,436 @@ FALLBACK_SECTORS = {
 if "score_weights" not in st.session_state:
     st.session_state.score_weights = INITIAL_SCORE_WEIGHTS.copy()
 
-if "kpax_fv_weights" not in st.session_state:
-    st.session_state.kpax_fv_weights = INITIAL_KPAX_FV_WEIGHTS.copy()
-
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def safe_float(value):
     """
-    Converts scalar-like values to float.
-    Returns None for invalid / missing data.
+    Converts values safely to float.
+
+    None / NaN / inf / invalid strings -> None
     """
-    try:
-        if value is None:
-            return None
-
-        if isinstance(value, (pd.Series, pd.DataFrame)):
-            if len(value) == 0:
-                return None
-            value = value.iloc[0]
-
-        if pd.isna(value):
-            return None
-
-        value = float(value)
-
-        if not np.isfinite(value):
-            return None
-
-        return value
-
-    except Exception:
-        return None
-
-
-def clamp_score(value):
-    """
-    Valid computed score: 5..100.
-    None remains None.
-    """
-    value = safe_float(value)
-
     if value is None:
         return None
 
-    return float(np.clip(value, MIN_VALID_SCORE, MAX_SCORE))
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(x):
+        return None
+
+    return x
+
+
+def is_valid_number(value):
+    return safe_float(value) is not None
+
+
+def clamp(value, low, high):
+    x = safe_float(value)
+
+    if x is None:
+        return None
+
+    return max(low, min(high, x))
+
+
+def clamp_score(value):
+    return clamp(value, 5.0, 100.0)
 
 
 def normalize_weights(weights):
-    """
-    Normalize positive weights to 100%.
-    """
     clean = {}
 
     for key, value in weights.items():
-        try:
-            v = float(value)
-        except Exception:
-            v = 0.0
+        x = safe_float(value)
 
-        clean[key] = max(0.0, v)
+        if x is not None and x >= 0:
+            clean[key] = x
+        else:
+            clean[key] = 0.0
 
     total = sum(clean.values())
 
     if total <= 0:
-        return {k: 1.0 / len(clean) for k in clean}
+        n = len(clean)
 
-    return {k: v / total for k, v in clean.items()}
+        if n == 0:
+            return clean
+
+        return {k: 1.0 / n for k in clean}
+
+    return {
+        k: v / total
+        for k, v in clean.items()
+    }
 
 
-def weighted_score(components):
+def weighted_score(components, weights):
     """
-    components = [(score, weight), ...]
-    Missing scores are excluded and weights renormalized.
+    Calculates a weighted score.
+
+    Missing values are NOT treated as zero.
+    Missing components are renormalized here only for
+    sub-models where partial availability is explicitly intended.
+
+    The main Investment Score handles missing KPAX-FV separately.
     """
+
+    numerator = 0.0
+    denominator = 0.0
+
+    for key, value in components.items():
+
+        x = safe_float(value)
+        w = safe_float(weights.get(key))
+
+        if x is None or w is None or w <= 0:
+            continue
+
+        numerator += x * w
+        denominator += w
+
+    if denominator <= 0:
+        return None
+
+    return clamp_score(numerator / denominator)
+
+
+def median_valid(values):
     valid = []
 
-    for score, weight in components:
-        score = safe_float(score)
-        weight = safe_float(weight)
+    for value in values:
+        x = safe_float(value)
 
-        if score is not None and weight is not None and weight > 0:
-            valid.append((score, weight))
+        if x is not None:
+            valid.append(x)
 
     if not valid:
         return None
 
-    total_weight = sum(w for _, w in valid)
+    return float(np.median(valid))
 
-    if total_weight <= 0:
+
+def mean_valid(values):
+    valid = []
+
+    for value in values:
+        x = safe_float(value)
+
+        if x is not None:
+            valid.append(x)
+
+    if not valid:
         return None
 
-    value = sum(score * weight for score, weight in valid) / total_weight
-
-    return clamp_score(value)
+    return float(np.mean(valid))
 
 
-def get_latest(df, labels):
-    """
-    Get latest value from a financial statement.
-    """
-    if df is None or df.empty:
+def pct_change(current, previous):
+    c = safe_float(current)
+    p = safe_float(previous)
+
+    if c is None or p is None or p == 0:
         return None
 
-    for label in labels:
-        if label in df.index:
-            try:
-                series = df.loc[label].dropna()
+    return (c / p - 1.0) * 100.0
 
-                if len(series) > 0:
-                    return safe_float(series.iloc[0])
-            except Exception:
-                pass
+
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+
+def format_number(value, decimals=1):
+    x = safe_float(value)
+
+    if x is None:
+        return "—"
+
+    return f"{x:,.{decimals}f}"
+
+
+def format_price(value):
+    x = safe_float(value)
+
+    if x is None:
+        return "—"
+
+    return f"{x:,.2f}"
+
+
+def format_score(value):
+    x = safe_float(value)
+
+    if x is None:
+        return "—"
+
+    return f"{x:.1f}"
+
+
+def format_pct(value):
+    x = safe_float(value)
+
+    if x is None:
+        return "—"
+
+    sign = "+" if x > 0 else ""
+
+    return f"{sign}{x:.1f}%"
+
+
+# ============================================================
+# DATAFRAME VALUE EXTRACTION
+# ============================================================
+
+def normalize_label(label):
+    """
+    Normalizes Yahoo financial statement labels.
+    """
+
+    if label is None:
+        return ""
+
+    text = str(label).strip().lower()
+
+    replacements = {
+        " ": "",
+        "_": "",
+        "-": "",
+        "/": "",
+        "(": "",
+        ")": "",
+        ",": "",
+        ".": ""
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return text
+
+
+def find_row(df, candidates):
+    """
+    Finds a financial statement row using normalized labels.
+    """
+
+    if df is None or not isinstance(df, pd.DataFrame):
+        return None
+
+    if df.empty:
+        return None
+
+    normalized_candidates = {
+        normalize_label(x)
+        for x in candidates
+    }
+
+    for idx in df.index:
+
+        if normalize_label(idx) in normalized_candidates:
+            return idx
+
+    # fuzzy fallback
+    for idx in df.index:
+
+        current = normalize_label(idx)
+
+        for candidate in normalized_candidates:
+
+            if candidate in current or current in candidate:
+                return idx
 
     return None
 
 
-def get_series(df, labels):
+def get_row_values(df, candidates):
     """
-    Returns a cleaned numerical series from financial statement.
+    Returns valid numeric values from a financial statement row.
+    Ordered by newest columns first.
     """
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
 
-    for label in labels:
-        if label in df.index:
-            try:
-                series = pd.to_numeric(df.loc[label], errors="coerce")
-                series = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if df is None or not isinstance(df, pd.DataFrame):
+        return []
 
-                if len(series) > 0:
-                    return series
-            except Exception:
-                pass
+    if df.empty:
+        return []
 
-    return pd.Series(dtype=float)
+    row = find_row(df, candidates)
 
-
-def safe_pct_change(current, previous):
-    if current is None or previous is None:
-        return None
-
-    if previous == 0:
-        return None
-
-    return (current / previous - 1.0) * 100.0
-
-
-def score_positive(value, low, high):
-    """
-    Linear score where low = 5 and high = 100.
-    """
-    value = safe_float(value)
-
-    if value is None:
-        return None
-
-    if high == low:
-        return 50.0
-
-    score = 5 + 95 * ((value - low) / (high - low))
-
-    return clamp_score(score)
-
-
-def sigmoid_score(value, midpoint, scale, inverse=False):
-    """
-    Stable sigmoid.
-
-    Important:
-    exponent is clipped to avoid math range errors,
-    especially for 1810.HK and extreme valuation ratios.
-    """
-    value = safe_float(value)
-    midpoint = safe_float(midpoint)
-    scale = safe_float(scale)
-
-    if value is None or midpoint is None or scale is None or scale <= 0:
-        return None
-
-    z = (value - midpoint) / scale
-    z = float(np.clip(z, -60.0, 60.0))
+    if row is None:
+        return []
 
     try:
-        if inverse:
-            score = 5 + 95 / (1 + math.exp(z))
-        else:
-            score = 5 + 95 / (1 + math.exp(-z))
+        series = df.loc[row]
     except Exception:
-        return None
+        return []
 
-    return clamp_score(score)
+    values = []
 
+    try:
+        columns = list(series.index)
+        columns = sorted(
+            columns,
+            key=lambda x: str(x),
+            reverse=True
+        )
+    except Exception:
+        columns = list(series.index)
 
-def median_or_none(values):
-    clean = []
+    for col in columns:
 
-    for value in values:
-        value = safe_float(value)
+        value = safe_float(series[col])
 
         if value is not None:
-            clean.append(value)
+            values.append(value)
 
-    if not clean:
+    return values
+
+
+def get_latest_row_value(df, candidates):
+    values = get_row_values(df, candidates)
+
+    if not values:
         return None
 
-    return float(np.median(clean))
+    return values[0]
+
+
+def get_median_row_value(df, candidates):
+    values = get_row_values(df, candidates)
+
+    if not values:
+        return None
+
+    return median_valid(values)
 
 
 # ============================================================
-# DATA EXTRACTION
+# TICKER / COMPANY HELPERS
 # ============================================================
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def download_ticker(ticker):
-    """
-    Downloads ticker data.
-    """
+def get_info(ticker_obj):
     try:
-        obj = yf.Ticker(ticker)
+        info = ticker_obj.info
 
-        info = obj.info
+        if isinstance(info, dict):
+            return info
+
+    except Exception:
+        pass
+
+    return {}
+
+
+def get_fast_info(ticker_obj):
+    try:
+        fi = ticker_obj.fast_info
+
+        if fi is None:
+            return {}
 
         try:
-            income = obj.income_stmt
+            return dict(fi)
         except Exception:
-            income = pd.DataFrame()
+            return {}
 
-        try:
-            cashflow = obj.cashflow
-        except Exception:
-            cashflow = pd.DataFrame()
-
-        try:
-            balance = obj.balance_sheet
-        except Exception:
-            balance = pd.DataFrame()
-
-        try:
-            history = obj.history(
-                period="5y",
-                interval="1d",
-                auto_adjust=False
-            )
-        except Exception:
-            history = pd.DataFrame()
-
-        return {
-            "info": info if isinstance(info, dict) else {},
-            "income": income,
-            "cashflow": cashflow,
-            "balance": balance,
-            "history": history
-        }
-
-    except Exception as e:
-        return {
-            "info": {},
-            "income": pd.DataFrame(),
-            "cashflow": pd.DataFrame(),
-            "balance": pd.DataFrame(),
-            "history": pd.DataFrame(),
-            "error": str(e)
-        }
+    except Exception:
+        return {}
 
 
-# ============================================================
-# COMPANY / BASIC DATA
-# ============================================================
-
-def get_company_name(data, ticker):
-    info = data.get("info", {})
-
-    name = (
-        info.get("longName")
-        or info.get("shortName")
-        or ticker
-    )
-
-    return str(name)
-
-
-def get_sector(data, ticker):
-    info = data.get("info", {})
-
+def get_sector(ticker, info):
     sector = info.get("sector")
 
     if sector:
-        return sector
+        return str(sector)
 
     for sector_name, tickers in FALLBACK_SECTORS.items():
+
         if ticker in tickers:
             return sector_name
 
     return "Unknown"
 
 
-def get_price(data):
-    info = data.get("info", {})
+def is_financial_sector(sector):
+    return sector == "Financial Services"
 
-    price = (
-        info.get("currentPrice")
-        or info.get("regularMarketPrice")
-        or info.get("previousClose")
-    )
 
-    if price is not None:
-        return safe_float(price)
+# ============================================================
+# PRICE DATA
+# ============================================================
 
-    history = data.get("history")
+def get_history(ticker_obj, period="5y"):
 
-    if history is not None and not history.empty:
+    try:
+        hist = ticker_obj.history(
+            period=period,
+            auto_adjust=False,
+            actions=False
+        )
+
+        if hist is None or hist.empty:
+            return pd.DataFrame()
+
+        hist = hist.copy()
+
+        hist = hist.replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+
+        return hist.dropna(
+            subset=["Close"],
+            how="all"
+        )
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_current_price(ticker_obj, hist=None, info=None):
+
+    info = info or {}
+
+    # 1. history
+    if hist is not None and not hist.empty:
+
         try:
-            return safe_float(history["Close"].dropna().iloc[-1])
+            close = safe_float(hist["Close"].dropna().iloc[-1])
+
+            if close is not None and close > 0:
+                return close
+
         except Exception:
             pass
 
-    return None
+    # 2. fast_info
+    fast_info = get_fast_info(ticker_obj)
 
+    for key in [
+        "lastPrice",
+        "last_price",
+        "regularMarketPrice"
+    ]:
 
-def get_currency(data):
-    info = data.get("info", {})
-    return info.get("currency")
+        value = safe_float(fast_info.get(key))
 
+        if value is not None and value > 0:
+            return value
 
-def get_market_cap(data):
-    info = data.get("info", {})
-    return safe_float(info.get("marketCap"))
+    # 3. info
+    for key in [
+        "currentPrice",
+        "regularMarketPrice",
+        "previousClose"
+    ]:
 
-
-def get_beta(data):
-    info = data.get("info", {})
-    return safe_float(info.get("beta"))
-
-
-# ============================================================
-# SHARES
-# ============================================================
-
-def get_shares(data):
-    info = data.get("info", {})
-
-    candidates = [
-        info.get("sharesOutstanding"),
-        info.get("impliedSharesOutstanding")
-    ]
-
-    for value in candidates:
-        value = safe_float(value)
+        value = safe_float(info.get(key))
 
         if value is not None and value > 0:
             return value
@@ -481,283 +566,548 @@ def get_shares(data):
 
 
 # ============================================================
-# EARNINGS / GROWTH
+# FINANCIAL STATEMENTS
 # ============================================================
 
-def get_eps_history(data):
-    income = data.get("income")
+def safe_statement(ticker_obj, attribute_name):
 
-    series = get_series(
-        income,
+    try:
+
+        df = getattr(ticker_obj, attribute_name)
+
+        if df is None:
+            return pd.DataFrame()
+
+        if not isinstance(df, pd.DataFrame):
+            return pd.DataFrame()
+
+        if df.empty:
+            return pd.DataFrame()
+
+        return df.copy()
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_financials(ticker_obj):
+
+    data = {}
+
+    # Annual
+    data["income"] = safe_statement(
+        ticker_obj,
+        "income_stmt"
+    )
+
+    data["balance"] = safe_statement(
+        ticker_obj,
+        "balance_sheet"
+    )
+
+    data["cashflow"] = safe_statement(
+        ticker_obj,
+        "cashflow"
+    )
+
+    # TTM fallback
+    data["ttm_income"] = safe_statement(
+        ticker_obj,
+        "ttm_income_stmt"
+    )
+
+    data["ttm_cashflow"] = safe_statement(
+        ticker_obj,
+        "ttm_cashflow"
+    )
+
+    # Quarterly fallback
+    data["quarterly_income"] = safe_statement(
+        ticker_obj,
+        "quarterly_income_stmt"
+    )
+
+    data["quarterly_cashflow"] = safe_statement(
+        ticker_obj,
+        "quarterly_cashflow"
+    )
+
+    return data
+
+
+# ============================================================
+# FUNDAMENTAL DATA
+# ============================================================
+
+def get_revenue(financials):
+
+    candidates = [
+        "Total Revenue",
+        "Operating Revenue",
+        "Revenue"
+    ]
+
+    value = get_latest_row_value(
+        financials.get("income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    value = get_latest_row_value(
+        financials.get("ttm_income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    return get_latest_row_value(
+        financials.get("quarterly_income"),
+        candidates
+    )
+
+
+def get_net_income(financials):
+
+    candidates = [
+        "Net Income",
+        "Net Income Common Stockholders",
+        "Net Income Including Noncontrolling Interests"
+    ]
+
+    value = get_latest_row_value(
+        financials.get("income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    value = get_latest_row_value(
+        financials.get("ttm_income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    return get_latest_row_value(
+        financials.get("quarterly_income"),
+        candidates
+    )
+
+
+def get_operating_income(financials):
+
+    candidates = [
+        "Operating Income",
+        "EBIT"
+    ]
+
+    value = get_latest_row_value(
+        financials.get("income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    value = get_latest_row_value(
+        financials.get("ttm_income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    return get_latest_row_value(
+        financials.get("quarterly_income"),
+        candidates
+    )
+
+
+def get_gross_profit(financials):
+
+    return get_latest_row_value(
+        financials.get("income"),
+        [
+            "Gross Profit"
+        ]
+    )
+
+
+def get_eps_from_statements(financials):
+
+    candidates = [
+        "Diluted EPS",
+        "Basic EPS",
+        "Diluted EPS Continuing Operations",
+        "Basic EPS Continuing Operations"
+    ]
+
+    value = get_latest_row_value(
+        financials.get("income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    value = get_latest_row_value(
+        financials.get("ttm_income"),
+        candidates
+    )
+
+    if value is not None:
+        return value
+
+    return get_latest_row_value(
+        financials.get("quarterly_income"),
+        candidates
+    )
+
+
+def get_eps(ticker_obj, info, financials):
+
+    # 1. financial statement
+    value = get_eps_from_statements(financials)
+
+    if value is not None:
+        return value
+
+    # 2. info
+    for key in [
+        "trailingEps",
+        "epsTrailingTwelveMonths"
+    ]:
+
+        value = safe_float(info.get(key))
+
+        if value is not None:
+            return value
+
+    return None
+
+
+def get_forward_eps(info):
+
+    for key in [
+        "forwardEps",
+        "epsForward"
+    ]:
+
+        value = safe_float(info.get(key))
+
+        if value is not None:
+            return value
+
+    return None
+
+
+def get_growth(ticker_obj, info, financials):
+
+    # 1. info growth
+    for key in [
+        "earningsGrowth",
+        "earningsQuarterlyGrowth"
+    ]:
+
+        value = safe_float(info.get(key))
+
+        if value is not None:
+            return value * 100.0
+
+    # 2. historical EPS growth
+    eps_values = get_row_values(
+        financials.get("income"),
         [
             "Diluted EPS",
             "Basic EPS"
         ]
     )
 
-    return series
+    if len(eps_values) >= 2:
+
+        newest = eps_values[0]
+        oldest = eps_values[-1]
+
+        if (
+            newest is not None
+            and oldest is not None
+            and oldest > 0
+            and newest > 0
+        ):
+
+            years = max(
+                1,
+                len(eps_values) - 1
+            )
+
+            growth = (
+                (newest / oldest) ** (1 / years) - 1
+            ) * 100
+
+            return clamp(
+                growth,
+                -50,
+                100
+            )
+
+    return None
 
 
-def get_earnings_growth(data):
-    info = data.get("info", {})
+# ============================================================
+# FREE CASH FLOW
+# ============================================================
+
+def get_fcf_values(financials):
 
     candidates = [
-        info.get("earningsGrowth"),
-        info.get("earningsQuarterlyGrowth")
+        "Free Cash Flow"
     ]
 
-    for value in candidates:
-        value = safe_float(value)
-
-        if value is not None:
-            return value * 100
-
-    eps = get_eps_history(data)
-
-    if len(eps) >= 2:
-        current = eps.iloc[0]
-        previous = eps.iloc[-1]
-
-        growth = safe_pct_change(current, previous)
-
-        if growth is not None:
-            return growth
-
-    return None
-
-
-def get_revenue_growth(data):
-    info = data.get("info", {})
-
-    value = safe_float(info.get("revenueGrowth"))
-
-    if value is not None:
-        return value * 100
-
-    income = data.get("income")
-
-    revenue = get_series(
-        income,
-        [
-            "Total Revenue",
-            "Operating Revenue"
-        ]
+    values = get_row_values(
+        financials.get("cashflow"),
+        candidates
     )
 
-    if len(revenue) >= 2:
-        return safe_pct_change(
-            revenue.iloc[0],
-            revenue.iloc[-1]
-        )
+    if values:
+        return values
 
-    return None
-
-
-def get_forward_eps(data):
-    info = data.get("info", {})
-
-    return safe_float(
-        info.get("forwardEps")
+    values = get_row_values(
+        financials.get("ttm_cashflow"),
+        candidates
     )
 
+    if values:
+        return values
 
-def get_long_term_growth(data):
-    info = data.get("info", {})
-
-    value = safe_float(
-        info.get("earningsGrowth")
+    values = get_row_values(
+        financials.get("quarterly_cashflow"),
+        candidates
     )
 
-    if value is not None:
-        return value * 100
+    if values:
+        return values
 
-    return None
-
-
-def get_forward_earnings_growth(data):
-    info = data.get("info", {})
-
-    forward = safe_float(info.get("earningsQuarterlyGrowth"))
-
-    if forward is not None:
-        return forward * 100
-
-    return get_earnings_growth(data)
-
-
-# ============================================================
-# FCF
-# ============================================================
-
-def get_fcf_series(data):
-    """
-    Robust annual FCF extraction.
-
-    Priority:
-    1. Free Cash Flow
-    2. Operating Cash Flow + Capital Expenditure
-
-    Yahoo often does NOT expose a direct "Free Cash Flow"
-    row in cashflow. Therefore we reconstruct it.
-    """
-
-    cashflow = data.get("cashflow")
-
-    if cashflow is None or cashflow.empty:
-        return pd.Series(dtype=float)
-
-    # Direct FCF
-    direct = get_series(
-        cashflow,
-        [
-            "Free Cash Flow"
-        ]
-    )
-
-    if len(direct) > 0:
-        return direct
-
-    # Operating Cash Flow
-    ocf = get_series(
-        cashflow,
+    # calculate FCF = Operating Cash Flow - CapEx
+    ocf = get_row_values(
+        financials.get("cashflow"),
         [
             "Operating Cash Flow",
             "Total Cash From Operating Activities"
         ]
     )
 
-    # CapEx
-    capex = get_series(
-        cashflow,
+    capex = get_row_values(
+        financials.get("cashflow"),
         [
             "Capital Expenditure",
-            "Capital Expenditure Reported"
+            "Capital Expenditures"
         ]
     )
 
-    if len(ocf) == 0 or len(capex) == 0:
-        return pd.Series(dtype=float)
+    if ocf and capex:
 
-    # Align by date
-    try:
-        df = pd.concat(
-            [
-                ocf.rename("ocf"),
-                capex.rename("capex")
-            ],
-            axis=1
-        ).dropna()
-
-        if df.empty:
-            return pd.Series(dtype=float)
-
-        # Yahoo usually reports CapEx as negative.
-        # If positive, convert to negative.
-        df["capex"] = np.where(
-            df["capex"] > 0,
-            -df["capex"],
-            df["capex"]
+        n = min(
+            len(ocf),
+            len(capex)
         )
 
-        fcf = df["ocf"] + df["capex"]
+        calculated = []
 
-        return fcf.dropna()
+        for i in range(n):
 
-    except Exception:
-        return pd.Series(dtype=float)
+            fcf = ocf[i] - abs(capex[i])
+
+            if np.isfinite(fcf):
+                calculated.append(fcf)
+
+        if calculated:
+            return calculated
+
+    return []
 
 
-def get_current_fcf(data):
-    info = data.get("info", {})
+def get_normalized_fcf(financials):
 
-    value = safe_float(
-        info.get("freeCashflow")
+    values = get_fcf_values(financials)
+
+    positive = [
+        x for x in values
+        if safe_float(x) is not None
+        and x > 0
+    ]
+
+    if not positive:
+        return None
+
+    # maximum 3 latest annual values
+    positive = positive[:3]
+
+    return median_valid(positive)
+
+
+# ============================================================
+# BALANCE SHEET
+# ============================================================
+
+def get_cash(financials):
+
+    return get_latest_row_value(
+        financials.get("balance"),
+        [
+            "Cash Cash Equivalents And Short Term Investments",
+            "Cash And Cash Equivalents",
+            "Cash Financial",
+            "Cash"
+        ]
+    )
+
+
+def get_debt(financials):
+
+    # Prefer total debt
+    value = get_latest_row_value(
+        financials.get("balance"),
+        [
+            "Total Debt"
+        ]
     )
 
     if value is not None:
-        return value
+        return abs(value)
 
-    series = get_fcf_series(data)
+    # fallback current + long-term debt
+    current = get_latest_row_value(
+        financials.get("balance"),
+        [
+            "Current Debt",
+            "Current Debt And Capital Lease Obligation",
+            "Current Debt And Lease Obligation"
+        ]
+    )
 
-    if len(series) > 0:
-        return safe_float(series.iloc[0])
+    long_term = get_latest_row_value(
+        financials.get("balance"),
+        [
+            "Long Term Debt",
+            "Long Term Debt And Capital Lease Obligation",
+            "Long Term Debt And Lease Obligation"
+        ]
+    )
+
+    if current is not None or long_term is not None:
+
+        return (
+            abs(current or 0)
+            + abs(long_term or 0)
+        )
 
     return None
 
 
-def get_normalized_fcf(data):
-    """
-    Uses the median of the latest positive annual FCF values.
+def get_equity(financials):
 
-    This is deliberately robust against one-off FCF peaks,
-    especially for cyclical semiconductor companies.
-
-    Returns:
-        normalized_fcf,
-        number_of_years,
-        all_positive_values
-    """
-
-    series = get_fcf_series(data)
-
-    if len(series) == 0:
-        current = get_current_fcf(data)
-
-        if current is not None and current > 0:
-            return current, 1, [current]
-
-        return None, 0, []
-
-    # Latest three annual observations
-    values = []
-
-    for value in series.iloc[:3]:
-        value = safe_float(value)
-
-        if value is not None:
-            values.append(value)
-
-    if not values:
-        return None, 0, []
-
-    # For valuation we need positive sustainable FCF.
-    positive = [
-        value for value in values
-        if value > 0
-    ]
-
-    if len(positive) >= 2:
-        normalized = float(np.median(positive))
-        return normalized, len(positive), positive
-
-    if len(positive) == 1:
-        return positive[0], 1, positive
-
-    return None, 0, []
-
-
-def get_fcf_margin(data):
-    info = data.get("info", {})
-
-    direct = safe_float(
-        info.get("freeCashflow")
-    )
-
-    revenue = get_latest(
-        data.get("income"),
+    return get_latest_row_value(
+        financials.get("balance"),
         [
-            "Total Revenue",
-            "Operating Revenue"
+            "Stockholders Equity",
+            "Common Stock Equity",
+            "Total Equity Gross Minority Interest"
         ]
     )
 
-    if direct is not None and revenue is not None and revenue > 0:
-        return direct / revenue * 100
 
-    fcf_series = get_fcf_series(data)
+def get_current_assets(financials):
 
-    if len(fcf_series) > 0 and revenue is not None and revenue > 0:
-        return fcf_series.iloc[0] / revenue * 100
+    return get_latest_row_value(
+        financials.get("balance"),
+        [
+            "Current Assets"
+        ]
+    )
+
+
+def get_current_liabilities(financials):
+
+    return get_latest_row_value(
+        financials.get("balance"),
+        [
+            "Current Liabilities"
+        ]
+    )
+
+
+# ============================================================
+# SHARES / MARKET CAP
+# ============================================================
+
+def get_shares(ticker_obj, info, financials, price):
+
+    # 1. income statement
+    value = get_latest_row_value(
+        financials.get("income"),
+        [
+            "Diluted Average Shares",
+            "Basic Average Shares",
+            "Diluted Average Shares Outstanding"
+        ]
+    )
+
+    if value is not None and value > 0:
+        return value
+
+    # 2. info
+    for key in [
+        "sharesOutstanding",
+        "impliedSharesOutstanding"
+    ]:
+
+        value = safe_float(info.get(key))
+
+        if value is not None and value > 0:
+            return value
+
+    # 3. market cap / price
+    market_cap = safe_float(
+        info.get("marketCap")
+    )
+
+    price = safe_float(price)
+
+    if (
+        market_cap is not None
+        and market_cap > 0
+        and price is not None
+        and price > 0
+    ):
+        return market_cap / price
+
+    return None
+
+
+def get_market_cap(info, price, shares):
+
+    market_cap = safe_float(
+        info.get("marketCap")
+    )
+
+    if market_cap is not None and market_cap > 0:
+        return market_cap
+
+    price = safe_float(price)
+    shares = safe_float(shares)
+
+    if (
+        price is not None
+        and shares is not None
+        and price > 0
+        and shares > 0
+    ):
+        return price * shares
 
     return None
 
@@ -766,286 +1116,142 @@ def get_fcf_margin(data):
 # PROFITABILITY
 # ============================================================
 
-def get_gross_margin(data):
-    info = data.get("info", {})
+def get_gross_margin(revenue, gross_profit):
 
-    value = safe_float(
-        info.get("grossMargins")
-    )
-
-    if value is not None:
-        return value * 100
-
-    income = data.get("income")
-
-    revenue = get_latest(
-        income,
-        [
-            "Total Revenue",
-            "Operating Revenue"
-        ]
-    )
-
-    gross_profit = get_latest(
-        income,
-        [
-            "Gross Profit"
-        ]
-    )
-
-    if revenue is not None and revenue > 0 and gross_profit is not None:
-        return gross_profit / revenue * 100
-
-    return None
-
-
-def get_net_margin(data):
-    info = data.get("info", {})
-
-    value = safe_float(
-        info.get("profitMargins")
-    )
-
-    if value is not None:
-        return value * 100
-
-    income = data.get("income")
-
-    revenue = get_latest(
-        income,
-        [
-            "Total Revenue",
-            "Operating Revenue"
-        ]
-    )
-
-    net_income = get_latest(
-        income,
-        [
-            "Net Income",
-            "Net Income Common Stockholders"
-        ]
-    )
-
-    if revenue is not None and revenue > 0 and net_income is not None:
-        return net_income / revenue * 100
-
-    return None
-
-
-def get_roe(data):
-    info = data.get("info", {})
-
-    value = safe_float(
-        info.get("returnOnEquity")
-    )
-
-    if value is not None:
-        return value * 100
-
-    return None
-
-
-def calculate_roic(data):
-    """
-    Approximate ROIC:
-
-    NOPAT / Invested Capital
-
-    Invested Capital ≈ Total Debt + Equity - Cash
-
-    Falls back to ROA when required inputs are unavailable.
-    """
-
-    income = data.get("income")
-    balance = data.get("balance")
-
-    operating_income = get_latest(
-        income,
-        [
-            "Operating Income"
-        ]
-    )
-
-    total_debt = get_latest(
-        balance,
-        [
-            "Total Debt"
-        ]
-    )
-
-    equity = get_latest(
-        balance,
-        [
-            "Stockholders Equity",
-            "Total Equity Gross Minority Interest",
-            "Common Stock Equity"
-        ]
-    )
-
-    cash = get_latest(
-        balance,
-        [
-            "Cash Cash Equivalents And Short Term Investments",
-            "Cash And Cash Equivalents"
-        ]
-    )
+    revenue = safe_float(revenue)
+    gross_profit = safe_float(gross_profit)
 
     if (
-        operating_income is not None
-        and equity is not None
+        revenue is None
+        or gross_profit is None
+        or revenue == 0
     ):
-        if total_debt is None:
-            total_debt = 0.0
+        return None
 
-        if cash is None:
-            cash = 0.0
+    return (
+        gross_profit / revenue
+    ) * 100
 
-        invested_capital = (
-            total_debt
-            + equity
-            - cash
-        )
 
-        if invested_capital > 0:
-            tax_expense = get_latest(
-                income,
-                [
-                    "Tax Provision"
-                ]
-            )
+def get_net_margin(revenue, net_income):
 
-            pretax_income = get_latest(
-                income,
-                [
-                    "Pretax Income"
-                ]
-            )
+    revenue = safe_float(revenue)
+    net_income = safe_float(net_income)
 
-            if (
-                tax_expense is not None
-                and pretax_income is not None
-                and pretax_income > 0
-            ):
-                tax_rate = abs(tax_expense) / pretax_income
-                tax_rate = float(
-                    np.clip(tax_rate, 0, 0.35)
-                )
-            else:
-                tax_rate = 0.21
+    if (
+        revenue is None
+        or net_income is None
+        or revenue == 0
+    ):
+        return None
 
-            nopat = operating_income * (1 - tax_rate)
+    return (
+        net_income / revenue
+    ) * 100
 
-            return nopat / invested_capital * 100
 
-    # ROA fallback
-    roa = get_latest(
-        income,
-        [
-            "Net Income"
-        ]
+def get_fcf_margin(revenue, normalized_fcf):
+
+    revenue = safe_float(revenue)
+    fcf = safe_float(normalized_fcf)
+
+    if (
+        revenue is None
+        or fcf is None
+        or revenue == 0
+    ):
+        return None
+
+    return (
+        fcf / revenue
+    ) * 100
+
+
+def get_roa(net_income, equity, debt):
+
+    net_income = safe_float(net_income)
+    equity = safe_float(equity)
+    debt = safe_float(debt)
+
+    if (
+        net_income is None
+        or equity is None
+        or equity <= 0
+    ):
+        return None
+
+    denominator = equity
+
+    if debt is not None and debt > 0:
+        denominator += debt
+
+    if denominator <= 0:
+        return None
+
+    return (
+        net_income / denominator
+    ) * 100
+
+
+def get_roic(
+    operating_income,
+    tax_rate,
+    equity,
+    debt,
+    cash
+):
+
+    ebit = safe_float(operating_income)
+    tax = safe_float(tax_rate)
+    equity = safe_float(equity)
+    debt = safe_float(debt)
+    cash = safe_float(cash)
+
+    if (
+        ebit is None
+        or equity is None
+        or equity <= 0
+    ):
+        return None
+
+    if tax is None:
+        tax = 20.0
+
+    nopat = ebit * (
+        1 - tax / 100
     )
 
-    assets = get_latest(
-        balance,
-        [
-            "Total Assets"
-        ]
+    invested_capital = equity + (
+        debt if debt is not None else 0
+    ) - (
+        cash if cash is not None else 0
     )
 
-    if roa is not None and assets is not None and assets > 0:
-        return roa / assets * 100
+    if invested_capital <= 0:
+        return None
 
-    return None
-
-
-# ============================================================
-# DEBT / BALANCE SHEET
-# ============================================================
-
-def get_total_debt(data):
-    return get_latest(
-        data.get("balance"),
-        [
-            "Total Debt"
-        ]
-    )
-
-
-def get_cash(data):
-    return get_latest(
-        data.get("balance"),
-        [
-            "Cash Cash Equivalents And Short Term Investments",
-            "Cash And Cash Equivalents"
-        ]
-    )
-
-
-def get_equity(data):
-    return get_latest(
-        data.get("balance"),
-        [
-            "Stockholders Equity",
-            "Total Equity Gross Minority Interest",
-            "Common Stock Equity"
-        ]
-    )
-
-
-def get_debt_equity(data):
-    info = data.get("info", {})
-
-    value = safe_float(
-        info.get("debtToEquity")
-    )
-
-    if value is not None:
-        return value / 100
-
-    debt = get_total_debt(data)
-    equity = get_equity(data)
-
-    if debt is not None and equity is not None and equity > 0:
-        return debt / equity
-
-    return None
-
-
-def get_cash_debt_ratio(data):
-    debt = get_total_debt(data)
-    cash = get_cash(data)
-
-    if debt is not None and debt > 0 and cash is not None:
-        return cash / debt
-
-    return None
-
-
-def get_current_ratio(data):
-    info = data.get("info", {})
-
-    return safe_float(
-        info.get("currentRatio")
-    )
+    return (
+        nopat / invested_capital
+    ) * 100
 
 
 # ============================================================
 # VALUATION DATA
 # ============================================================
 
-def get_forward_pe(data):
-    info = data.get("info", {})
+def get_trailing_pe(price, eps, info):
 
+    # Yahoo direct value
     value = safe_float(
-        info.get("forwardPE")
+        info.get("trailingPE")
     )
 
     if value is not None and value > 0:
         return value
 
-    price = get_price(data)
-    eps = get_forward_eps(data)
+    # calculate
+    price = safe_float(price)
+    eps = safe_float(eps)
 
     if (
         price is not None
@@ -1057,47 +1263,62 @@ def get_forward_pe(data):
     return None
 
 
-def get_trailing_pe(data):
-    info = data.get("info", {})
+def get_forward_pe(price, forward_eps, info):
 
     value = safe_float(
-        info.get("trailingPE")
+        info.get("forwardPE")
     )
 
     if value is not None and value > 0:
         return value
 
+    price = safe_float(price)
+    forward_eps = safe_float(forward_eps)
+
+    if (
+        price is not None
+        and forward_eps is not None
+        and forward_eps > 0
+    ):
+        return price / forward_eps
+
     return None
 
 
-def get_peg(data):
-    info = data.get("info", {})
+def get_price_sales(
+    market_cap,
+    revenue,
+    info
+):
 
     value = safe_float(
-        info.get("pegRatio")
+        info.get(
+            "priceToSalesTrailing12Months"
+        )
     )
 
     if value is not None and value > 0:
         return value
 
-    return None
+    market_cap = safe_float(market_cap)
+    revenue = safe_float(revenue)
 
-
-def get_price_sales(data):
-    info = data.get("info", {})
-
-    value = safe_float(
-        info.get("priceToSalesTrailing12Months")
-    )
-
-    if value is not None and value > 0:
-        return value
+    if (
+        market_cap is not None
+        and revenue is not None
+        and market_cap > 0
+        and revenue > 0
+    ):
+        return market_cap / revenue
 
     return None
 
 
-def get_price_book(data):
-    info = data.get("info", {})
+def get_price_book(
+    market_cap,
+    equity,
+    info
+):
 
     value = safe_float(
         info.get("priceToBook")
@@ -1106,299 +1327,322 @@ def get_price_book(data):
     if value is not None and value > 0:
         return value
 
+    market_cap = safe_float(market_cap)
+    equity = safe_float(equity)
+
+    if (
+        market_cap is not None
+        and equity is not None
+        and market_cap > 0
+        and equity > 0
+    ):
+        return market_cap / equity
+
     return None
+
+
+def get_peg(
+    info,
+    forward_pe,
+    growth
+):
+
+    value = safe_float(
+        info.get("pegRatio")
+    )
+
+    if value is not None and value > 0:
+        return value
+
+    forward_pe = safe_float(forward_pe)
+    growth = safe_float(growth)
+
+    if (
+        forward_pe is None
+        or growth is None
+        or growth <= 0
+    ):
+        return None
+
+    return forward_pe / growth
 
 
 # ============================================================
 # ANALYST TARGET
 # ============================================================
 
-def get_analyst_target(data):
-    info = data.get("info", {})
+def get_analyst_target(ticker_obj, info):
 
-    candidates = [
-        info.get("targetMeanPrice"),
-        info.get("targetMedianPrice")
+    # Current yfinance API
+    try:
+        targets = ticker_obj.analyst_price_targets
+
+        if isinstance(targets, dict):
+
+            mean = safe_float(
+                targets.get("mean")
+            )
+
+            median = safe_float(
+                targets.get("median")
+            )
+
+            result = median_valid([
+                mean,
+                median
+            ])
+
+            if result is not None and result > 0:
+                return result
+
+    except Exception:
+        pass
+
+    # info fallback
+    values = [
+        safe_float(
+            info.get("targetMeanPrice")
+        ),
+        safe_float(
+            info.get("targetMedianPrice")
+        )
     ]
 
-    values = []
+    result = median_valid(values)
 
-    for value in candidates:
-        value = safe_float(value)
+    if result is not None and result > 0:
+        return result
 
-        if value is not None and value > 0:
-            values.append(value)
-
-    if not values:
-        return None
-
-    return float(np.median(values))
+    return None
 
 
 # ============================================================
 # FAIR VALUE
 # ============================================================
 
-def fair_value_model(data):
-    """
-    V20.4 robust Fair Value model.
+def stable_fair_pe(growth):
 
-    Earnings FV:
-        Forward EPS × Fair P/E
+    growth = safe_float(growth)
 
-    Fair P/E:
-        12 + 0.25 × growth
-        bounded 12..24
+    if growth is None:
+        return 16.0
 
-    FCF FV:
-        normalized FCF/share / target yield
+    fair_pe = (
+        12.0
+        + 0.25 * growth
+    )
 
-    Analyst FV:
-        analyst consensus target
+    return clamp(
+        fair_pe,
+        12.0,
+        24.0
+    )
 
-    Important V20.4 changes:
-        - normalized 3Y FCF
-        - model-level price bounds
-        - robust median reference
-        - final FV cap 0.40x..2.50x price
-    """
 
-    price = get_price(data)
+def earnings_fair_value(
+    price,
+    forward_eps,
+    trailing_eps,
+    growth
+):
 
-    if price is None or price <= 0:
+    eps = safe_float(forward_eps)
+    source = "forward"
+
+    if eps is None:
+        eps = safe_float(trailing_eps)
+        source = "trailing"
+
+    if eps is None or eps <= 0:
+        return None, None, None
+
+    fair_pe = stable_fair_pe(growth)
+
+    fair_value = eps * fair_pe
+
+    if fair_value <= 0:
+        return None, None, None
+
+    return fair_value, fair_pe, source
+
+
+def fcf_fair_value(
+    normalized_fcf,
+    shares,
+    growth,
+    beta
+):
+
+    fcf = safe_float(normalized_fcf)
+    shares = safe_float(shares)
+    growth = safe_float(growth)
+    beta = safe_float(beta)
+
+    if (
+        fcf is None
+        or shares is None
+        or fcf <= 0
+        or shares <= 0
+    ):
+        return None, None
+
+    fcf_per_share = (
+        fcf / shares
+    )
+
+    if growth is None:
+        growth = 10.0
+
+    target_yield = (
+        7.0
+        - 0.08 * growth
+    )
+
+    target_yield = clamp(
+        target_yield,
+        4.5,
+        9.0
+    )
+
+    if beta is not None and beta > 1.0:
+        target_yield += (
+            beta - 1.0
+        ) * 0.75
+
+    target_yield = clamp(
+        target_yield,
+        4.5,
+        11.0
+    )
+
+    fair_value = (
+        fcf_per_share
+        / (target_yield / 100.0)
+    )
+
+    if fair_value <= 0:
+        return None, None
+
+    return fair_value, target_yield
+
+
+def fair_value_model(
+    price,
+    forward_eps,
+    trailing_eps,
+    normalized_fcf,
+    shares,
+    growth,
+    analyst_target,
+    beta,
+    financial
+):
+
+    earnings_fv, fair_pe, earnings_source = (
+        earnings_fair_value(
+            price,
+            forward_eps,
+            trailing_eps,
+            growth
+        )
+    )
+
+    fcf_fv, target_yield = (
+        fcf_fair_value(
+            normalized_fcf,
+            shares,
+            growth,
+            beta
+        )
+    )
+
+    analyst_fv = safe_float(
+        analyst_target
+    )
+
+    candidates = []
+
+    if earnings_fv is not None:
+        candidates.append(
+            earnings_fv
+        )
+
+    if fcf_fv is not None:
+        candidates.append(
+            fcf_fv
+        )
+
+    if analyst_fv is not None and analyst_fv > 0:
+        candidates.append(
+            analyst_fv
+        )
+
+    if not candidates:
         return {
             "fair_value": None,
             "fair_value_score": None,
             "earnings_fv": None,
             "fcf_fv": None,
-            "analyst_fv": None,
-            "normalized_fcf": None,
-            "fcf_years": 0,
-            "model_count": 0,
-            "model_confidence": 0
-        }
-
-    growth = get_long_term_growth(data)
-
-    if growth is None:
-        growth = get_earnings_growth(data)
-
-    if growth is None:
-        growth = 8.0
-
-    growth = float(np.clip(growth, -10, 50))
-
-    # --------------------------------------------------------
-    # 1. Earnings FV
-    # --------------------------------------------------------
-
-    forward_eps = get_forward_eps(data)
-
-    earnings_fv = None
-
-    if (
-        forward_eps is not None
-        and forward_eps > 0
-    ):
-        fair_pe = 12 + 0.25 * growth
-        fair_pe = float(np.clip(fair_pe, 12, 24))
-
-        earnings_fv = forward_eps * fair_pe
-
-    # --------------------------------------------------------
-    # 2. Normalized FCF FV
-    # --------------------------------------------------------
-
-    normalized_fcf, fcf_years, _ = get_normalized_fcf(data)
-
-    shares = get_shares(data)
-
-    fcf_fv = None
-
-    if (
-        normalized_fcf is not None
-        and normalized_fcf > 0
-        and shares is not None
-        and shares > 0
-    ):
-        fcf_per_share = normalized_fcf / shares
-
-        target_yield = (
-            0.070
-            - 0.0008 * growth
-        )
-
-        target_yield = float(
-            np.clip(
-                target_yield,
-                0.045,
-                0.090
-            )
-        )
-
-        beta = get_beta(data)
-
-        if beta is not None and beta > 1:
-            target_yield += min(
-                (beta - 1) * 0.005,
-                0.02
-            )
-
-        target_yield = float(
-            np.clip(
-                target_yield,
-                0.045,
-                0.110
-            )
-        )
-
-        fcf_fv = fcf_per_share / target_yield
-
-    # --------------------------------------------------------
-    # 3. Analyst FV
-    # --------------------------------------------------------
-
-    analyst_fv = get_analyst_target(data)
-
-    # --------------------------------------------------------
-    # Model-level bounds
-    # --------------------------------------------------------
-
-    raw_models = [
-        earnings_fv,
-        fcf_fv,
-        analyst_fv
-    ]
-
-    bounded_models = []
-
-    for model in raw_models:
-        if model is None:
-            bounded_models.append(None)
-            continue
-
-        model = float(
-            np.clip(
-                model,
-                price * 0.25,
-                price * 2.50
-            )
-        )
-
-        bounded_models.append(model)
-
-    earnings_fv = bounded_models[0]
-    fcf_fv = bounded_models[1]
-    analyst_fv = bounded_models[2]
-
-    # --------------------------------------------------------
-    # Robust median reference
-    # --------------------------------------------------------
-
-    valid_models = [
-        x for x in bounded_models
-        if x is not None and x > 0
-    ]
-
-    if not valid_models:
-        return {
-            "fair_value": None,
-            "fair_value_score": None,
-            "earnings_fv": None,
-            "fcf_fv": None,
-            "analyst_fv": None,
+            "analyst_fv": analyst_fv,
             "normalized_fcf": normalized_fcf,
-            "fcf_years": fcf_years,
             "model_count": 0,
-            "model_confidence": 0
+            "model_confidence": 0.0,
+            "earnings_source": earnings_source,
+            "fair_pe": fair_pe,
+            "target_yield": target_yield
         }
 
-    median_model = float(
-        np.median(valid_models)
-    )
+    # Model weights
+    if financial:
 
-    # --------------------------------------------------------
-    # Robust outlier bounding around median
-    # --------------------------------------------------------
-
-    robust_models = []
-
-    for model in valid_models:
-        bounded = float(
-            np.clip(
-                model,
-                median_model * 0.50,
-                median_model * 1.80
-            )
-        )
-
-        robust_models.append(bounded)
-
-    # --------------------------------------------------------
-    # Financial vs non-financial weighting
-    # --------------------------------------------------------
-
-    sector = get_sector(
-        data,
-        ""
-    )
-
-    is_financial = (
-        sector == "Financial Services"
-    )
-
-    if is_financial:
         weights = {
             "earnings": 0.35,
             "fcf": 0.15,
             "analyst": 0.50
         }
+
     else:
+
         weights = {
             "earnings": 0.45,
             "fcf": 0.25,
             "analyst": 0.30
         }
 
-    weighted_parts = []
+    models = {
+        "earnings": earnings_fv,
+        "fcf": fcf_fv,
+        "analyst": analyst_fv
+    }
 
-    if earnings_fv is not None:
-        value = float(
-            np.clip(
-                earnings_fv,
-                median_model * 0.50,
-                median_model * 1.80
-            )
-        )
-        weighted_parts.append(
-            (value, weights["earnings"])
-        )
+    weighted_values = []
+    weighted_weights = []
 
-    if fcf_fv is not None:
-        value = float(
-            np.clip(
-                fcf_fv,
-                median_model * 0.50,
-                median_model * 1.80
-            )
-        )
-        weighted_parts.append(
-            (value, weights["fcf"])
+    for key, value in models.items():
+
+        x = safe_float(value)
+
+        if x is None or x <= 0:
+            continue
+
+        weighted_values.append(
+            x * weights[key]
         )
 
-    if analyst_fv is not None:
-        value = float(
-            np.clip(
-                analyst_fv,
-                median_model * 0.50,
-                median_model * 1.80
-            )
-        )
-        weighted_parts.append(
-            (value, weights["analyst"])
+        weighted_weights.append(
+            weights[key]
         )
 
-    if not weighted_parts:
+    if not weighted_weights:
+        fair_value = None
+
+    else:
+        fair_value = (
+            sum(weighted_values)
+            / sum(weighted_weights)
+        )
+
+    if fair_value is None:
         return {
             "fair_value": None,
             "fair_value_score": None,
@@ -1406,77 +1650,86 @@ def fair_value_model(data):
             "fcf_fv": fcf_fv,
             "analyst_fv": analyst_fv,
             "normalized_fcf": normalized_fcf,
-            "fcf_years": fcf_years,
-            "model_count": 0,
-            "model_confidence": 0
+            "model_count": len(candidates),
+            "model_confidence": 0.0,
+            "earnings_source": earnings_source,
+            "fair_pe": fair_pe,
+            "target_yield": target_yield
         }
 
-    total_weight = sum(
-        weight for _, weight in weighted_parts
-    )
+    # Robust bounds
+    price = safe_float(price)
 
-    fair_value = (
-        sum(
-            value * weight
-            for value, weight in weighted_parts
+    if price is not None and price > 0:
+
+        fair_value = clamp(
+            fair_value,
+            price * 0.25,
+            price * 2.50
         )
-        / total_weight
+
+    # median bound
+    median_model = median_valid(
+        candidates
     )
 
-    # --------------------------------------------------------
-    # Final hard price bound
-    # --------------------------------------------------------
+    if median_model is not None:
 
-    fair_value = float(
-        np.clip(
+        fair_value = clamp(
+            fair_value,
+            median_model * 0.50,
+            median_model * 1.80
+        )
+
+    if price is not None and price > 0:
+
+        fair_value = clamp(
             fair_value,
             price * 0.40,
             price * 2.50
         )
-    )
 
-    # --------------------------------------------------------
-    # Fair Value Score
-    # --------------------------------------------------------
+    if price is not None and price > 0:
 
-    upside_pct = (
-        fair_value / price - 1
-    ) * 100
+        upside = (
+            fair_value / price - 1
+        ) * 100
 
-    # Softer V20.4 slope
-    fair_value_score = clamp_score(
-        55 + 0.60 * upside_pct
-    )
+        fv_score = clamp_score(
+            55.0
+            + 0.60 * upside
+        )
 
-    # --------------------------------------------------------
-    # Model confidence
-    # --------------------------------------------------------
+    else:
+        fv_score = None
 
-    model_count = len(valid_models)
+    # Confidence
+    model_count = len(candidates)
 
-    confidence = {
-        1: 45,
-        2: 75,
-        3: 100
-    }.get(model_count, 0)
+    if model_count >= 3:
+        model_confidence = 100.0
 
-    if fcf_years >= 2:
-        confidence += 5
+    elif model_count == 2:
+        model_confidence = 75.0
 
-    confidence = int(
-        np.clip(confidence, 0, 100)
-    )
+    elif model_count == 1:
+        model_confidence = 45.0
+
+    else:
+        model_confidence = 0.0
 
     return {
         "fair_value": fair_value,
-        "fair_value_score": fair_value_score,
+        "fair_value_score": fv_score,
         "earnings_fv": earnings_fv,
         "fcf_fv": fcf_fv,
         "analyst_fv": analyst_fv,
         "normalized_fcf": normalized_fcf,
-        "fcf_years": fcf_years,
         "model_count": model_count,
-        "model_confidence": confidence
+        "model_confidence": model_confidence,
+        "earnings_source": earnings_source,
+        "fair_pe": fair_pe,
+        "target_yield": target_yield
     }
 
 
@@ -1484,596 +1737,585 @@ def fair_value_model(data):
 # RELATIVE VALUATION
 # ============================================================
 
-def relative_valuation(data):
-    """
-    V20.4 Relative Valuation.
+def sigmoid_score(
+    value,
+    fair_value,
+    sensitivity=1.0
+):
 
-    Non-financial:
-        Forward PE 35%
-        Trailing PE 10%
-        PEG 30%
-        P/S 25%
+    value = safe_float(value)
+    fair_value = safe_float(fair_value)
 
-    Financial:
-        Forward PE 35%
-        Trailing PE 15%
-        PEG 15%
-        P/B 35%
-
-    Smooth sigmoid scoring avoids hard thresholds.
-    """
-
-    sector = get_sector(
-        data,
-        ""
-    )
-
-    is_financial = (
-        sector == "Financial Services"
-    )
-
-    forward_pe = get_forward_pe(data)
-    trailing_pe = get_trailing_pe(data)
-    peg = get_peg(data)
-    ps = get_price_sales(data)
-    pb = get_price_book(data)
-
-    components = []
-
-    # Forward PE
-    if forward_pe is not None and forward_pe > 0:
-        components.append(
-            (
-                sigmoid_score(
-                    forward_pe,
-                    22,
-                    8,
-                    inverse=True
-                ),
-                0.35
-            )
-        )
-
-    # Trailing PE
-    if trailing_pe is not None and trailing_pe > 0:
-        components.append(
-            (
-                sigmoid_score(
-                    trailing_pe,
-                    25,
-                    10,
-                    inverse=True
-                ),
-                0.15 if is_financial else 0.10
-            )
-        )
-
-    # PEG
-    if peg is not None and peg > 0:
-        components.append(
-            (
-                sigmoid_score(
-                    peg,
-                    1.8,
-                    0.8,
-                    inverse=True
-                ),
-                0.15 if is_financial else 0.30
-            )
-        )
-
-    if is_financial:
-        if pb is not None and pb > 0:
-            components.append(
-                (
-                    sigmoid_score(
-                        pb,
-                        1.8,
-                        1.0,
-                        inverse=True
-                    ),
-                    0.35
-                )
-            )
-    else:
-        if ps is not None and ps > 0:
-            components.append(
-                (
-                    sigmoid_score(
-                        ps,
-                        4.0,
-                        2.5,
-                        inverse=True
-                    ),
-                    0.25
-                )
-            )
-
-    scores = [
-        (score, weight)
-        for score, weight in components
-        if score is not None
-    ]
-
-    if not scores:
+    if (
+        value is None
+        or fair_value is None
+        or value <= 0
+        or fair_value <= 0
+    ):
         return None
 
-    return weighted_score(scores)
+    ratio = value / fair_value
+
+    try:
+
+        exponent = (
+            (ratio - 1.0)
+            * sensitivity
+        )
+
+        exponent = clamp(
+            exponent,
+            -20,
+            20
+        )
+
+        score = (
+            100.0
+            / (
+                1.0
+                + math.exp(exponent)
+            )
+        )
+
+        return clamp_score(
+            score
+        )
+
+    except Exception:
+        return None
+
+
+def relative_valuation(
+    forward_pe,
+    trailing_pe,
+    peg,
+    price_sales,
+    price_book,
+    financial
+):
+
+    components = {}
+
+    if financial:
+
+        # Lower PE is better
+        if forward_pe is not None:
+            components["forward_pe"] = (
+                sigmoid_score(
+                    forward_pe,
+                    18.0,
+                    4.0
+                )
+            )
+
+        if trailing_pe is not None:
+            components["trailing_pe"] = (
+                sigmoid_score(
+                    trailing_pe,
+                    20.0,
+                    3.0
+                )
+            )
+
+        if peg is not None:
+            components["peg"] = (
+                sigmoid_score(
+                    peg,
+                    1.5,
+                    3.0
+                )
+            )
+
+        if price_book is not None:
+            components["price_book"] = (
+                sigmoid_score(
+                    price_book,
+                    2.0,
+                    2.5
+                )
+            )
+
+        weights = {
+            "forward_pe": 0.35,
+            "trailing_pe": 0.15,
+            "peg": 0.15,
+            "price_book": 0.35
+        }
+
+    else:
+
+        if forward_pe is not None:
+            components["forward_pe"] = (
+                sigmoid_score(
+                    forward_pe,
+                    20.0,
+                    4.0
+                )
+            )
+
+        if trailing_pe is not None:
+            components["trailing_pe"] = (
+                sigmoid_score(
+                    trailing_pe,
+                    22.0,
+                    3.0
+                )
+            )
+
+        if peg is not None:
+            components["peg"] = (
+                sigmoid_score(
+                    peg,
+                    1.5,
+                    3.0
+                )
+            )
+
+        if price_sales is not None:
+            components["price_sales"] = (
+                sigmoid_score(
+                    price_sales,
+                    4.0,
+                    2.0
+                )
+            )
+
+        weights = {
+            "forward_pe": 0.35,
+            "trailing_pe": 0.10,
+            "peg": 0.30,
+            "price_sales": 0.25
+        }
+
+    valid_components = {
+        k: v
+        for k, v in components.items()
+        if v is not None
+    }
+
+    if not valid_components:
+        return None, 0.0
+
+    score = weighted_score(
+        valid_components,
+        weights
+    )
+
+    availability = (
+        sum(
+            weights[k]
+            for k in valid_components
+        )
+        / sum(weights.values())
+    ) * 100.0
+
+    return score, availability
 
 
 # ============================================================
-# QUALITY SCORE
+# QUALITY
 # ============================================================
 
-def quality_score(data):
-    sector = get_sector(
-        data,
-        ""
-    )
+def quality_score(
+    financial,
+    roic,
+    roa,
+    roe,
+    gross_margin,
+    net_margin,
+    fcf_margin,
+    earnings_growth,
+    revenue_growth
+):
 
-    is_financial = (
-        sector == "Financial Services"
-    )
+    if financial:
 
-    earnings_growth = get_earnings_growth(data)
-    revenue_growth = get_revenue_growth(data)
-    gross_margin = get_gross_margin(data)
-    fcf_margin = get_fcf_margin(data)
-    roic = calculate_roic(data)
-    roe = get_roe(data)
-    net_margin = get_net_margin(data)
+        components = {
+            "roe": roe,
+            "net_margin": net_margin,
+            "earnings_growth": earnings_growth,
+            "revenue_growth": revenue_growth
+        }
 
-    components = []
+        weights = {
+            "roe": 0.40,
+            "net_margin": 0.30,
+            "earnings_growth": 0.20,
+            "revenue_growth": 0.10
+        }
 
-    if is_financial:
+        scores = {}
 
         if roe is not None:
-            components.append(
-                (
-                    score_positive(
-                        roe,
-                        0,
-                        25
-                    ),
-                    0.40
-                )
+            scores["roe"] = clamp_score(
+                50 + roe * 2.0
             )
 
         if net_margin is not None:
-            components.append(
-                (
-                    score_positive(
-                        net_margin,
-                        0,
-                        30
-                    ),
-                    0.30
-                )
-            )
-
-        if earnings_growth is not None:
-            components.append(
-                (
-                    score_positive(
-                        earnings_growth,
-                        -10,
-                        30
-                    ),
-                    0.20
-                )
-            )
-
-        if revenue_growth is not None:
-            components.append(
-                (
-                    score_positive(
-                        revenue_growth,
-                        -5,
-                        20
-                    ),
-                    0.10
-                )
+            scores["net_margin"] = clamp_score(
+                50 + net_margin * 2.0
             )
 
     else:
 
+        components = {
+            "roic": roic,
+            "gross_margin": gross_margin,
+            "fcf_margin": fcf_margin,
+            "earnings_growth": earnings_growth,
+            "revenue_growth": revenue_growth
+        }
+
+        weights = {
+            "roic": 0.30,
+            "gross_margin": 0.15,
+            "fcf_margin": 0.20,
+            "earnings_growth": 0.20,
+            "revenue_growth": 0.15
+        }
+
+        scores = {}
+
         if roic is not None:
-            components.append(
-                (
-                    score_positive(
-                        roic,
-                        0,
-                        25
-                    ),
-                    0.30
-                )
+            scores["roic"] = clamp_score(
+                50 + roic * 2.0
             )
 
         if gross_margin is not None:
-            components.append(
-                (
-                    score_positive(
-                        gross_margin,
-                        10,
-                        70
-                    ),
-                    0.15
-                )
+            scores["gross_margin"] = clamp_score(
+                30 + gross_margin * 0.80
             )
 
         if fcf_margin is not None:
-            components.append(
-                (
-                    score_positive(
-                        fcf_margin,
-                        -5,
-                        30
-                    ),
-                    0.20
-                )
+            scores["fcf_margin"] = clamp_score(
+                50 + fcf_margin * 2.0
             )
 
-        if earnings_growth is not None:
-            components.append(
-                (
-                    score_positive(
-                        earnings_growth,
-                        -10,
-                        35
-                    ),
-                    0.20
-                )
-            )
+    # Growth
+    if earnings_growth is not None:
+        scores["earnings_growth"] = clamp_score(
+            50 + earnings_growth * 1.5
+        )
 
-        if revenue_growth is not None:
-            components.append(
-                (
-                    score_positive(
-                        revenue_growth,
-                        -5,
-                        25
-                    ),
-                    0.15
-                )
-            )
+    if revenue_growth is not None:
+        scores["revenue_growth"] = clamp_score(
+            50 + revenue_growth * 1.5
+        )
 
-    return weighted_score(components)
+    return weighted_score(
+        scores,
+        weights
+    )
 
 
 # ============================================================
 # FUTURE SCORE
 # ============================================================
 
-def future_score(data):
-    earnings_growth = get_earnings_growth(data)
-    revenue_growth = get_revenue_growth(data)
-    forward_growth = get_forward_earnings_growth(data)
-    long_term_growth = get_long_term_growth(data)
-    fcf_margin = get_fcf_margin(data)
+def future_score(
+    earnings_growth,
+    revenue_growth,
+    fcf_margin,
+    analyst_target,
+    price
+):
 
-    acceleration = None
-
-    if (
-        forward_growth is not None
-        and earnings_growth is not None
-    ):
-        acceleration = (
-            forward_growth
-            - earnings_growth
-        )
-
-    components = []
+    scores = {}
 
     if earnings_growth is not None:
-        components.append(
-            (
-                score_positive(
-                    earnings_growth,
-                    -10,
-                    35
-                ),
-                0.25
-            )
+        scores["earnings"] = clamp_score(
+            50 + earnings_growth * 1.5
         )
 
     if revenue_growth is not None:
-        components.append(
-            (
-                score_positive(
-                    revenue_growth,
-                    -5,
-                    25
-                ),
-                0.20
-            )
-        )
-
-    if forward_growth is not None:
-        components.append(
-            (
-                score_positive(
-                    forward_growth,
-                    -10,
-                    35
-                ),
-                0.20
-            )
-        )
-
-    if long_term_growth is not None:
-        components.append(
-            (
-                score_positive(
-                    long_term_growth,
-                    -5,
-                    30
-                ),
-                0.15
-            )
+        scores["revenue"] = clamp_score(
+            50 + revenue_growth * 1.2
         )
 
     if fcf_margin is not None:
-        components.append(
-            (
-                score_positive(
-                    fcf_margin,
-                    -5,
-                    30
-                ),
-                0.10
-            )
+        scores["fcf"] = clamp_score(
+            50 + fcf_margin * 1.5
         )
 
-    if acceleration is not None:
-        components.append(
-            (
-                score_positive(
-                    acceleration,
-                    -20,
-                    20
-                ),
-                0.10
-            )
+    price = safe_float(price)
+    target = safe_float(analyst_target)
+
+    if (
+        price is not None
+        and target is not None
+        and price > 0
+        and target > 0
+    ):
+
+        analyst_upside = (
+            target / price - 1
+        ) * 100
+
+        scores["analyst"] = clamp_score(
+            55 + analyst_upside * 0.5
         )
 
-    score = weighted_score(components)
+    weights = {
+        "earnings": 0.35,
+        "revenue": 0.20,
+        "fcf": 0.20,
+        "analyst": 0.25
+    }
 
-    return score
+    return weighted_score(
+        scores,
+        weights
+    )
 
 
 # ============================================================
 # KPAX
 # ============================================================
 
-def kpax_score(data):
-    quality = quality_score(data)
-    future = future_score(data)
+def kpax_score(
+    quality,
+    future
+):
+
+    components = {
+        "quality": quality,
+        "future": future
+    }
+
+    weights = {
+        "quality": 0.40,
+        "future": 0.60
+    }
 
     return weighted_score(
-        [
-            (quality, 0.40),
-            (future, 0.60)
-        ]
+        components,
+        weights
     )
 
 
 # ============================================================
-# KPAX-FV
+# KPAX FAIR VALUE
 # ============================================================
 
-def kpax_fv_score(fair_value_score, relative_score):
-    weights = normalize_weights(
-        st.session_state.kpax_fv_weights
+def kpax_fv_score(
+    fair_value_score,
+    relative_score
+):
+
+    components = {
+        "fair_value": fair_value_score,
+        "relative": relative_score
+    }
+
+    weights = {
+        "fair_value": 0.55,
+        "relative": 0.45
+    }
+
+    score = weighted_score(
+        components,
+        weights
     )
 
-    return weighted_score(
-        [
-            (
-                fair_value_score,
-                weights["fair_value"]
-            ),
-            (
-                relative_score,
-                weights["relative_valuation"]
-            )
-        ]
-    )
+    # availability
+    available = 0
+
+    if fair_value_score is not None:
+        available += 0.55
+
+    if relative_score is not None:
+        available += 0.45
+
+    availability = (
+        available / 1.0
+    ) * 100.0
+
+    return score, availability
 
 
 # ============================================================
 # RISK
 # ============================================================
 
-def calculate_volatility(history):
-    if history is None or history.empty:
+def get_beta(info):
+
+    for key in [
+        "beta",
+        "beta3Year"
+    ]:
+
+        value = safe_float(
+            info.get(key)
+        )
+
+        if value is not None:
+            return value
+
+    return None
+
+
+def risk_score(
+    hist,
+    beta,
+    debt_to_equity
+):
+
+    market_score = None
+    stability_score = None
+    financial_score = None
+
+    # Market risk
+    if hist is not None and not hist.empty:
+
+        try:
+
+            close = (
+                hist["Close"]
+                .dropna()
+            )
+
+            returns = (
+                close
+                .pct_change()
+                .dropna()
+            )
+
+            if len(returns) > 30:
+
+                volatility = (
+                    returns.std()
+                    * math.sqrt(252)
+                    * 100
+                )
+
+                rolling_max = (
+                    close
+                    .cummax()
+                )
+
+                drawdown = (
+                    close / rolling_max - 1
+                )
+
+                max_drawdown = (
+                    abs(drawdown.min())
+                    * 100
+                )
+
+                vol_score = clamp_score(
+                    100 - volatility * 1.8
+                )
+
+                dd_score = clamp_score(
+                    100 - max_drawdown * 0.9
+                )
+
+                market_score = (
+                    vol_score * 0.55
+                    + dd_score * 0.45
+                )
+
+                stability_score = (
+                    100
+                    - max_drawdown * 0.8
+                )
+
+                stability_score = clamp_score(
+                    stability_score
+                )
+
+        except Exception:
+            pass
+
+    # Beta fallback
+    if market_score is None and beta is not None:
+
+        market_score = clamp_score(
+            100 - max(
+                0,
+                beta - 0.8
+            ) * 45
+        )
+
+    # Financial risk
+    if debt_to_equity is not None:
+
+        financial_score = clamp_score(
+            100
+            - min(
+                100,
+                max(
+                    0,
+                    debt_to_equity
+                ) * 0.5
+            )
+        )
+
+    components = {
+        "financial": financial_score,
+        "market": market_score,
+        "stability": stability_score
+    }
+
+    weights = {
+        "financial": 0.45,
+        "market": 0.35,
+        "stability": 0.20
+    }
+
+    return weighted_score(
+        components,
+        weights
+    )
+
+
+# ============================================================
+# TECHNICAL
+# ============================================================
+
+def technical_score(hist):
+
+    if hist is None or hist.empty:
         return None
 
     try:
-        returns = (
-            history["Close"]
-            .pct_change()
+
+        close = (
+            hist["Close"]
             .dropna()
         )
 
-        if len(returns) < 30:
+        if len(close) < 50:
             return None
 
-        volatility = (
-            returns.std()
-            * math.sqrt(252)
-            * 100
-        )
-
-        return volatility
-
-    except Exception:
-        return None
-
-
-def calculate_max_drawdown(history):
-    if history is None or history.empty:
-        return None
-
-    try:
-        close = history["Close"].dropna()
-
-        if len(close) < 30:
-            return None
-
-        running_max = close.cummax()
-
-        drawdown = (
-            close / running_max - 1
-        )
-
-        return abs(drawdown.min()) * 100
-
-    except Exception:
-        return None
-
-
-def risk_score(data):
-    history = data.get("history")
-
-    volatility = calculate_volatility(history)
-    drawdown = calculate_max_drawdown(history)
-
-    beta = get_beta(data)
-
-    market_components = []
-
-    if volatility is not None:
-        market_components.append(
-            (
-                sigmoid_score(
-                    volatility,
-                    30,
-                    15,
-                    inverse=True
-                ),
-                0.55
-            )
-        )
-
-    if drawdown is not None:
-        market_components.append(
-            (
-                sigmoid_score(
-                    drawdown,
-                    45,
-                    20,
-                    inverse=True
-                ),
-                0.45
-            )
-        )
-
-    market_score = weighted_score(
-        market_components
-    )
-
-    if market_score is None and beta is not None:
-        market_score = sigmoid_score(
-            beta,
-            1.2,
-            0.5,
-            inverse=True
-        )
-
-    debt_equity = get_debt_equity(data)
-    cash_debt = get_cash_debt_ratio(data)
-
-    stability_components = []
-
-    if debt_equity is not None:
-        stability_components.append(
-            (
-                sigmoid_score(
-                    debt_equity,
-                    1.0,
-                    0.8,
-                    inverse=True
-                ),
-                0.65
-            )
-        )
-
-    if cash_debt is not None:
-        stability_components.append(
-            (
-                sigmoid_score(
-                    cash_debt,
-                    0.5,
-                    0.5,
-                    inverse=False
-                ),
-                0.35
-            )
-        )
-
-    stability_score = weighted_score(
-        stability_components
-    )
-
-    financial_score = stability_score
-
-    if financial_score is None:
-        financial_score = 50
-
-    if market_score is None:
-        market_score = 50
-
-    if stability_score is None:
-        stability_score = 50
-
-    return weighted_score(
-        [
-            (financial_score, 0.45),
-            (market_score, 0.35),
-            (stability_score, 0.20)
-        ]
-    )
-
-
-# ============================================================
-# TECHNICAL SCORE
-# ============================================================
-
-def technical_score(data):
-    history = data.get("history")
-
-    if history is None or history.empty:
-        return None
-
-    try:
-        close = history["Close"].dropna()
-
-        if len(close) < 200:
-            return None
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma50 = close.rolling(50).mean().iloc[-1]
 
         price = close.iloc[-1]
 
-        sma50 = close.rolling(50).mean().iloc[-1]
-        sma200 = close.rolling(200).mean().iloc[-1]
+        score = 50.0
 
-        score = 50
-
-        if price > sma50:
-            score += 15
-        else:
-            score -= 15
-
-        if price > sma200:
+        if price > ma20:
             score += 20
+
         else:
             score -= 20
 
-        if sma50 > sma200:
-            score += 15
-        else:
-            score -= 15
+        if price > ma50:
+            score += 20
 
-        return clamp_score(score)
+        else:
+            score -= 20
+
+        if ma20 > ma50:
+            score += 10
+
+        else:
+            score -= 10
+
+        return clamp_score(
+            score
+        )
 
     except Exception:
         return None
@@ -2083,26 +2325,68 @@ def technical_score(data):
 # INVESTMENT SCORE
 # ============================================================
 
-def investment_score(kpax, kpax_fv, risk):
+def investment_score(
+    kpax,
+    kpax_fv,
+    risk
+):
+
     weights = normalize_weights(
         st.session_state.score_weights
     )
 
-    return weighted_score(
-        [
-            (
-                kpax,
-                weights["kpax"]
-            ),
-            (
-                kpax_fv,
-                weights["kpax_fv"]
-            ),
-            (
-                risk,
-                weights["risk"]
-            )
-        ]
+    # IMPORTANT:
+    # Missing KPAX-FV is NOT renormalized away.
+    #
+    # 50 = neutral information placeholder.
+    #
+    # This prevents:
+    # KPAX 95 + Risk 66 -> artificial Strong Buy
+    # when the entire valuation block is missing.
+
+    valuation_component = (
+        kpax_fv
+        if kpax_fv is not None
+        else 50.0
+    )
+
+    components = {
+        "kpax": kpax,
+        "kpax_fv": valuation_component,
+        "risk": risk
+    }
+
+    score = (
+        safe_float(kpax) * weights["kpax"]
+        if kpax is not None
+        else 0
+    )
+
+    score += (
+        valuation_component
+        * weights["kpax_fv"]
+    )
+
+    score += (
+        safe_float(risk)
+        * weights["risk"]
+        if risk is not None
+        else 0
+    )
+
+    # If KPAX itself is missing, score should not pretend
+    if kpax is None:
+
+        available_weight = (
+            weights["kpax_fv"]
+            + weights["risk"]
+        )
+
+        if available_weight <= 0:
+            return None
+
+    return clamp_score(
+        score
     )
 
 
@@ -2110,373 +2394,311 @@ def investment_score(kpax, kpax_fv, risk):
 # RECOMMENDATION
 # ============================================================
 
-def base_recommendation(score):
+def recommendation(
+    investment,
+    technical,
+    kpax_fv_available
+):
+
+    score = safe_float(
+        investment
+    )
+
     if score is None:
         return "—"
 
     if score >= 85:
-        return "Strong Buy"
+        rec = "Strong Buy"
 
-    if score >= 80:
-        return "Buy"
+    elif score >= 80:
+        rec = "Buy"
 
-    if score >= 75:
-        return "Accumulate"
+    elif score >= 75:
+        rec = "Accumulate"
 
-    if score >= 68:
-        return "Hold"
+    elif score >= 68:
+        rec = "Hold"
 
-    if score >= 55:
-        return "Reduce / Watch"
-
-    return "Avoid"
-
-
-def apply_technical_filter(recommendation, technical):
-    """
-    Technical is NOT part of Investment Score.
-
-    It only limits the maximum recommendation.
-    """
-
-    if recommendation == "—" or technical is None:
-        return recommendation
-
-    levels = [
-        "Avoid",
-        "Reduce / Watch",
-        "Hold",
-        "Accumulate",
-        "Buy",
-        "Strong Buy"
-    ]
-
-    current_index = levels.index(
-        recommendation
-    )
-
-    if technical < 30:
-        max_level = "Hold"
-
-    elif technical < 45:
-        max_level = "Accumulate"
-
-    elif technical < 60:
-        max_level = "Buy"
+    elif score >= 55:
+        rec = "Reduce / Watch"
 
     else:
-        max_level = "Strong Buy"
+        rec = "Avoid"
 
-    max_index = levels.index(
-        max_level
+    # Technical timing filter
+    tech = safe_float(
+        technical
     )
 
-    return levels[
-        min(current_index, max_index)
-    ]
+    if tech is not None:
+
+        if tech < 30:
+            rec = min_recommendation(
+                rec,
+                "Hold"
+            )
+
+        elif tech < 45:
+            rec = min_recommendation(
+                rec,
+                "Accumulate"
+            )
+
+        elif tech < 60:
+            rec = min_recommendation(
+                rec,
+                "Buy"
+            )
+
+    # CRITICAL:
+    # No complete valuation -> no Strong Buy
+    if not kpax_fv_available:
+
+        if rec == "Strong Buy":
+            rec = "Buy"
+
+        if rec == "Buy":
+            rec = "Accumulate"
+
+    return rec
+
+
+def recommendation_rank(rec):
+
+    ranks = {
+        "Avoid": 0,
+        "Reduce / Watch": 1,
+        "Hold": 2,
+        "Accumulate": 3,
+        "Buy": 4,
+        "Strong Buy": 5,
+        "—": -1
+    }
+
+    return ranks.get(
+        rec,
+        -1
+    )
+
+
+def min_recommendation(
+    current,
+    maximum
+):
+
+    if (
+        recommendation_rank(current)
+        > recommendation_rank(maximum)
+    ):
+        return maximum
+
+    return current
 
 
 # ============================================================
 # VERIFY
 # ============================================================
 
-def verify_score(data):
-    """
-    Independent cross-check.
+def verify_score(
+    financial,
+    earnings_growth,
+    revenue_growth,
+    roic,
+    roe,
+    net_margin,
+    fcf_margin,
+    debt_to_equity,
+    cash_to_debt,
+    current_ratio,
+    forward_pe,
+    trailing_pe,
+    peg,
+    price_sales,
+    price_book
+):
 
-    Growth 25%
-    Profitability 25%
-    Debt 15%
-    Valuation 35%
-    """
+    components = {}
 
-    sector = get_sector(
-        data,
-        ""
-    )
-
-    is_financial = (
-        sector == "Financial Services"
-    )
-
-    # --------------------------------------------------------
     # Growth
-    # --------------------------------------------------------
-
-    earnings_growth = get_earnings_growth(data)
-    revenue_growth = get_revenue_growth(data)
-
-    growth_components = []
+    growth_scores = []
 
     if earnings_growth is not None:
-        growth_components.append(
-            (
-                score_positive(
-                    earnings_growth,
-                    -10,
-                    35
-                ),
-                0.60
+        growth_scores.append(
+            clamp_score(
+                50 + earnings_growth * 1.5
             )
         )
 
     if revenue_growth is not None:
-        growth_components.append(
-            (
-                score_positive(
-                    revenue_growth,
-                    -5,
-                    25
-                ),
-                0.40
+        growth_scores.append(
+            clamp_score(
+                50 + revenue_growth * 1.2
             )
         )
 
-    growth = weighted_score(
-        growth_components
-    )
+    if growth_scores:
+        components["growth"] = mean_valid(
+            growth_scores
+        )
 
-    # --------------------------------------------------------
     # Profitability
-    # --------------------------------------------------------
+    profitability_scores = []
 
-    profitability_components = []
-
-    if is_financial:
-
-        roe = get_roe(data)
-        net_margin = get_net_margin(data)
+    if financial:
 
         if roe is not None:
-            profitability_components.append(
-                (
-                    score_positive(
-                        roe,
-                        0,
-                        25
-                    ),
-                    0.60
+            profitability_scores.append(
+                clamp_score(
+                    50 + roe * 2
                 )
             )
 
         if net_margin is not None:
-            profitability_components.append(
-                (
-                    score_positive(
-                        net_margin,
-                        0,
-                        30
-                    ),
-                    0.40
+            profitability_scores.append(
+                clamp_score(
+                    50 + net_margin * 2
                 )
-            )
 
     else:
 
-        roic = calculate_roic(data)
-        fcf_margin = get_fcf_margin(data)
-        gross_margin = get_gross_margin(data)
-
         if roic is not None:
-            profitability_components.append(
-                (
-                    score_positive(
-                        roic,
-                        0,
-                        25
-                    ),
-                    0.50
+            profitability_scores.append(
+                clamp_score(
+                    50 + roic * 2
                 )
             )
 
         if fcf_margin is not None:
-            profitability_components.append(
-                (
-                    score_positive(
-                        fcf_margin,
-                        -5,
-                        30
-                    ),
-                    0.30
+            profitability_scores.append(
+                clamp_score(
+                    50 + fcf_margin * 2
                 )
             )
 
-        if gross_margin is not None:
-            profitability_components.append(
-                (
-                    score_positive(
-                        gross_margin,
-                        10,
-                        70
-                    ),
-                    0.20
-                )
+    if profitability_scores:
+        components["profitability"] = (
+            mean_valid(
+                profitability_scores
             )
+        )
 
-    profitability = weighted_score(
-        profitability_components
-    )
-
-    # --------------------------------------------------------
     # Debt
-    # --------------------------------------------------------
+    debt_scores = []
 
-    debt_components = []
+    if debt_to_equity is not None:
 
-    debt_equity = get_debt_equity(data)
-    cash_debt = get_cash_debt_ratio(data)
-    current_ratio = get_current_ratio(data)
-
-    if debt_equity is not None:
-        debt_components.append(
-            (
-                sigmoid_score(
-                    debt_equity,
-                    1.0,
-                    0.8,
-                    inverse=True
-                ),
-                0.60
+        debt_scores.append(
+            clamp_score(
+                100
+                - max(
+                    0,
+                    debt_to_equity
+                ) * 0.5
             )
         )
 
-    if cash_debt is not None:
-        debt_components.append(
-            (
-                sigmoid_score(
-                    cash_debt,
-                    0.5,
-                    0.5,
-                    inverse=False
-                ),
-                0.25 if not is_financial else 0.40
+    if cash_to_debt is not None:
+
+        debt_scores.append(
+            clamp_score(
+                50
+                + cash_to_debt * 25
             )
         )
 
-    if (
-        not is_financial
-        and current_ratio is not None
-    ):
-        debt_components.append(
-            (
-                sigmoid_score(
-                    current_ratio,
-                    1.5,
-                    0.8,
-                    inverse=False
-                ),
-                0.15
+    if not financial and current_ratio is not None:
+
+        debt_scores.append(
+            clamp_score(
+                40
+                + current_ratio * 25
             )
         )
 
-    debt = weighted_score(
-        debt_components
-    )
+    if debt_scores:
+        components["debt"] = mean_valid(
+            debt_scores
+        )
 
-    # --------------------------------------------------------
     # Valuation
-    # --------------------------------------------------------
-
-    valuation_components = []
-
-    forward_pe = get_forward_pe(data)
-    peg = get_peg(data)
-    ps = get_price_sales(data)
-    pb = get_price_book(data)
+    valuation_scores = []
 
     if forward_pe is not None:
-        valuation_components.append(
-            (
-                sigmoid_score(
-                    forward_pe,
-                    22,
-                    8,
-                    inverse=True
-                ),
-                0.60 if is_financial else 0.50
+
+        valuation_scores.append(
+            sigmoid_score(
+                forward_pe,
+                20,
+                4
             )
         )
 
-    if is_financial:
+    if trailing_pe is not None:
 
-        if pb is not None:
-            valuation_components.append(
-                (
-                    sigmoid_score(
-                        pb,
-                        1.8,
-                        1.0,
-                        inverse=True
-                    ),
-                    0.40
-                )
+        valuation_scores.append(
+            sigmoid_score(
+                trailing_pe,
+                22,
+                3
             )
+        )
 
-    else:
+    if peg is not None:
 
-        if peg is not None:
-            valuation_components.append(
-                (
-                    sigmoid_score(
-                        peg,
-                        1.8,
-                        0.8,
-                        inverse=True
-                    ),
-                    0.30
-                )
+        valuation_scores.append(
+            sigmoid_score(
+                peg,
+                1.5,
+                3
             )
+        )
 
-        if ps is not None:
-            valuation_components.append(
-                (
-                    sigmoid_score(
-                        ps,
-                        4.0,
-                        2.5,
-                        inverse=True
-                    ),
-                    0.20
-                )
+    if financial and price_book is not None:
+
+        valuation_scores.append(
+            sigmoid_score(
+                price_book,
+                2.0,
+                2.5
             )
+        )
 
-    valuation = weighted_score(
-        valuation_components
-    )
+    if not financial and price_sales is not None:
 
-    # --------------------------------------------------------
-    # Final Verify
-    # --------------------------------------------------------
+        valuation_scores.append(
+            sigmoid_score(
+                price_sales,
+                4.0,
+                2
+            )
+        )
 
-    components = [
-        (growth, 0.25),
-        (profitability, 0.25),
-        (debt, 0.15),
-        (valuation, 0.35)
+    valuation_scores = [
+        x for x in valuation_scores
+        if x is not None
     ]
 
-    final = weighted_score(
-        components
-    )
+    if valuation_scores:
 
-    available = sum(
-        1
-        for score, _ in components
-        if score is not None
+        components["valuation"] = mean_valid(
+            valuation_scores
+        )
+
+    verify = weighted_score(
+        components,
+        {
+            "growth": 0.25,
+            "profitability": 0.25,
+            "debt": 0.15,
+            "valuation": 0.35
+        }
     )
 
     data_completeness = (
-        available / 4 * 100
-    )
+        len(components) / 4
+    ) * 100.0
 
-    return {
-        "verify": final,
-        "verify_data": data_completeness,
-        "verify_growth": growth,
-        "verify_profitability": profitability,
-        "verify_debt": debt,
-        "verify_valuation": valuation
-    }
+    return verify, data_completeness
 
 
 # ============================================================
@@ -2484,986 +2706,1488 @@ def verify_score(data):
 # ============================================================
 
 def model_confidence(
-    kpax,
-    kpax_fv,
-    risk,
-    fair_value_data,
-    verify_data,
-    history
+    component_availability,
+    fair_value_confidence,
+    verify_completeness,
+    history_length
 ):
-    component_count = sum(
+
+    history_score = clamp(
+        (
+            safe_float(history_length)
+            or 0
+        ) / 1000 * 100,
+        0,
+        100
+    )
+
+    score = (
+        (
+            safe_float(
+                component_availability
+            ) or 0
+        ) * 0.30
+        +
+        (
+            safe_float(
+                fair_value_confidence
+            ) or 0
+        ) * 0.35
+        +
+        (
+            safe_float(
+                verify_completeness
+            ) or 0
+        ) * 0.20
+        +
+        history_score * 0.15
+    )
+
+    return clamp_score(
+        score
+    )
+
+
+# ============================================================
+# DATA QUALITY
+# ============================================================
+
+def data_quality(
+    price,
+    revenue,
+    eps,
+    fcf,
+    equity,
+    debt,
+    growth,
+    fair_value,
+    relative_valuation,
+    analyst_target
+):
+
+    checks = [
+        price,
+        revenue,
+        eps,
+        fcf,
+        equity,
+        debt,
+        growth,
+        fair_value,
+        relative_valuation,
+        analyst_target
+    ]
+
+    available = sum(
         x is not None
-        for x in [
+        for x in checks
+    )
+
+    return (
+        available
+        / len(checks)
+    ) * 100.0
+
+
+# ============================================================
+# FULL TICKER ANALYSIS
+# ============================================================
+
+@st.cache_data(
+    ttl=900,
+    show_spinner=False
+)
+def analyze_ticker(ticker):
+
+    result = {
+        "Ticker": ticker,
+        "Price": None,
+        "Fair Value": None,
+        "FV Upside": None,
+        "FV Score": None,
+        "Relative Valuation": None,
+        "KPAX": None,
+        "KPAX-FV": None,
+        "Risk": None,
+        "Technical": None,
+        "Investment": None,
+        "Recommendation": "—",
+        "Verify": None,
+        "Gap": None,
+        "Status": "weak",
+        "Model Confidence": None,
+        "Sector": "Unknown",
+        "Data Quality": 0.0,
+
+        # diagnostics
+        "Revenue": None,
+        "EPS": None,
+        "Forward EPS": None,
+        "FCF": None,
+        "Equity": None,
+        "Debt": None,
+        "Cash": None,
+        "Growth": None,
+        "Forward PE": None,
+        "Trailing PE": None,
+        "PEG": None,
+        "P/S": None,
+        "P/B": None,
+        "Analyst Target": None,
+        "FV Models": 0,
+        "FV Availability": 0.0,
+        "Relative Availability": 0.0,
+        "History Days": 0
+    }
+
+    try:
+
+        yf_ticker = yf.Ticker(
+            ticker
+        )
+
+        # ----------------------------------------------------
+        # INFO
+        # ----------------------------------------------------
+
+        info = get_info(
+            yf_ticker
+        )
+
+        # ----------------------------------------------------
+        # HISTORY
+        # ----------------------------------------------------
+
+        hist = get_history(
+            yf_ticker,
+            "5y"
+        )
+
+        result["History Days"] = (
+            len(hist)
+            if hist is not None
+            else 0
+        )
+
+        price = get_current_price(
+            yf_ticker,
+            hist,
+            info
+        )
+
+        result["Price"] = price
+
+        if price is None:
+            return result
+
+        # ----------------------------------------------------
+        # FINANCIAL STATEMENTS
+        # ----------------------------------------------------
+
+        financials = load_financials(
+            yf_ticker
+        )
+
+        sector = get_sector(
+            ticker,
+            info
+        )
+
+        financial = is_financial_sector(
+            sector
+        )
+
+        result["Sector"] = sector
+
+        # ----------------------------------------------------
+        # FUNDAMENTALS
+        # ----------------------------------------------------
+
+        revenue = get_revenue(
+            financials
+        )
+
+        net_income = get_net_income(
+            financials
+        )
+
+        operating_income = get_operating_income(
+            financials
+        )
+
+        gross_profit = get_gross_profit(
+            financials
+        )
+
+        trailing_eps = get_eps(
+            yf_ticker,
+            info,
+            financials
+        )
+
+        forward_eps = get_forward_eps(
+            info
+        )
+
+        growth = get_growth(
+            yf_ticker,
+            info,
+            financials
+        )
+
+        normalized_fcf = get_normalized_fcf(
+            financials
+        )
+
+        equity = get_equity(
+            financials
+        )
+
+        debt = get_debt(
+            financials
+        )
+
+        cash = get_cash(
+            financials
+        )
+
+        current_assets = get_current_assets(
+            financials
+        )
+
+        current_liabilities = (
+            get_current_liabilities(
+                financials
+            )
+        )
+
+        shares = get_shares(
+            yf_ticker,
+            info,
+            financials,
+            price
+        )
+
+        market_cap = get_market_cap(
+            info,
+            price,
+            shares
+        )
+
+        # ----------------------------------------------------
+        # PROFITABILITY
+        # ----------------------------------------------------
+
+        gross_margin = get_gross_margin(
+            revenue,
+            gross_profit
+        )
+
+        net_margin = get_net_margin(
+            revenue,
+            net_income
+        )
+
+        fcf_margin = get_fcf_margin(
+            revenue,
+            normalized_fcf
+        )
+
+        tax_rate = safe_float(
+            info.get(
+                "effectiveTaxRate"
+            )
+        )
+
+        if tax_rate is not None:
+            tax_rate *= 100.0
+
+        roic = get_roic(
+            operating_income,
+            tax_rate,
+            equity,
+            debt,
+            cash
+        )
+
+        roa = get_roa(
+            net_income,
+            equity,
+            debt
+        )
+
+        roe = None
+
+        if (
+            net_income is not None
+            and equity is not None
+            and equity > 0
+        ):
+
+            roe = (
+                net_income
+                / equity
+            ) * 100
+
+        # Revenue growth from info
+        revenue_growth = safe_float(
+            info.get(
+                "revenueGrowth"
+            )
+        )
+
+        if revenue_growth is not None:
+            revenue_growth *= 100.0
+
+        # ----------------------------------------------------
+        # VALUATION
+        # ----------------------------------------------------
+
+        forward_pe = get_forward_pe(
+            price,
+            forward_eps,
+            info
+        )
+
+        trailing_pe = get_trailing_pe(
+            price,
+            trailing_eps,
+            info
+        )
+
+        price_sales = get_price_sales(
+            market_cap,
+            revenue,
+            info
+        )
+
+        price_book = get_price_book(
+            market_cap,
+            equity,
+            info
+        )
+
+        beta = get_beta(
+            info
+        )
+
+        peg = get_peg(
+            info,
+            forward_pe,
+            growth
+        )
+
+        analyst_target = get_analyst_target(
+            yf_ticker,
+            info
+        )
+
+        # ----------------------------------------------------
+        # FAIR VALUE
+        # ----------------------------------------------------
+
+        fv = fair_value_model(
+            price=price,
+            forward_eps=forward_eps,
+            trailing_eps=trailing_eps,
+            normalized_fcf=normalized_fcf,
+            shares=shares,
+            growth=growth,
+            analyst_target=analyst_target,
+            beta=beta,
+            financial=financial
+        )
+
+        fair_value = fv["fair_value"]
+        fair_value_score = fv[
+            "fair_value_score"
+        ]
+
+        # ----------------------------------------------------
+        # RELATIVE VALUATION
+        # ----------------------------------------------------
+
+        relative_score, relative_availability = (
+            relative_valuation(
+                forward_pe,
+                trailing_pe,
+                peg,
+                price_sales,
+                price_book,
+                financial
+            )
+        )
+
+        # ----------------------------------------------------
+        # QUALITY
+        # ----------------------------------------------------
+
+        quality = quality_score(
+            financial=financial,
+            roic=roic,
+            roa=roa,
+            roe=roe,
+            gross_margin=gross_margin,
+            net_margin=net_margin,
+            fcf_margin=fcf_margin,
+            earnings_growth=growth,
+            revenue_growth=revenue_growth
+        )
+
+        # ----------------------------------------------------
+        # FUTURE
+        # ----------------------------------------------------
+
+        future = future_score(
+            earnings_growth=growth,
+            revenue_growth=revenue_growth,
+            fcf_margin=fcf_margin,
+            analyst_target=analyst_target,
+            price=price
+        )
+
+        # ----------------------------------------------------
+        # KPAX
+        # ----------------------------------------------------
+
+        kpax = kpax_score(
+            quality,
+            future
+        )
+
+        # ----------------------------------------------------
+        # KPAX-FV
+        # ----------------------------------------------------
+
+        kpax_fv, kpax_fv_availability = (
+            kpax_fv_score(
+                fair_value_score,
+                relative_score
+            )
+        )
+
+        # ----------------------------------------------------
+        # RISK
+        # ----------------------------------------------------
+
+        debt_to_equity = None
+
+        if (
+            debt is not None
+            and equity is not None
+            and equity > 0
+        ):
+
+            debt_to_equity = (
+                debt / equity
+            ) * 100
+
+        cash_to_debt = None
+
+        if (
+            cash is not None
+            and debt is not None
+            and debt > 0
+        ):
+
+            cash_to_debt = (
+                cash / debt
+            )
+
+        current_ratio = None
+
+        if (
+            current_assets is not None
+            and current_liabilities is not None
+            and current_liabilities > 0
+        ):
+
+            current_ratio = (
+                current_assets
+                / current_liabilities
+            )
+
+        risk = risk_score(
+            hist,
+            beta,
+            debt_to_equity
+        )
+
+        # ----------------------------------------------------
+        # TECHNICAL
+        # ----------------------------------------------------
+
+        technical = technical_score(
+            hist
+        )
+
+        # ----------------------------------------------------
+        # INVESTMENT
+        # ----------------------------------------------------
+
+        investment = investment_score(
             kpax,
             kpax_fv,
             risk
+        )
+
+        # Complete valuation block?
+        valuation_complete = (
+            fair_value_score is not None
+            and relative_score is not None
+        )
+
+        # ----------------------------------------------------
+        # RECOMMENDATION
+        # ----------------------------------------------------
+
+        rec = recommendation(
+            investment,
+            technical,
+            valuation_complete
+        )
+
+        # ----------------------------------------------------
+        # VERIFY
+        # ----------------------------------------------------
+
+        verify, verify_completeness = (
+            verify_score(
+                financial=financial,
+                earnings_growth=growth,
+                revenue_growth=revenue_growth,
+                roic=roic,
+                roe=roe,
+                net_margin=net_margin,
+                fcf_margin=fcf_margin,
+                debt_to_equity=debt_to_equity,
+                cash_to_debt=cash_to_debt,
+                current_ratio=current_ratio,
+                forward_pe=forward_pe,
+                trailing_pe=trailing_pe,
+                peg=peg,
+                price_sales=price_sales,
+                price_book=price_book
+            )
+        )
+
+        gap = None
+
+        if (
+            investment is not None
+            and verify is not None
+        ):
+
+            gap = (
+                investment
+                - verify
+            )
+
+        if verify_completeness < 60:
+            status = "weak"
+
+        elif gap is None:
+            status = "yellow"
+
+        elif abs(gap) <= 10:
+            status = "green"
+
+        elif abs(gap) <= 20:
+            status = "yellow"
+
+        else:
+            status = "red"
+
+        # ----------------------------------------------------
+        # DATA QUALITY
+        # ----------------------------------------------------
+
+        quality_data = data_quality(
+            price,
+            revenue,
+            trailing_eps,
+            normalized_fcf,
+            equity,
+            debt,
+            growth,
+            fair_value,
+            relative_score,
+            analyst_target
+        )
+
+        component_values = [
+            quality,
+            future,
+            kpax,
+            fair_value_score,
+            relative_score,
+            risk,
+            technical
         ]
-    )
-
-    component_score = (
-        component_count / 3 * 100
-    )
-
-    fv_confidence = fair_value_data.get(
-        "model_confidence",
-        0
-    )
-
-    history_score = 0
-
-    if history is not None:
-        try:
-            days = len(history)
-
-            if days >= 700:
-                history_score = 100
-            elif days >= 400:
-                history_score = 80
-            elif days >= 200:
-                history_score = 60
-            elif days >= 100:
-                history_score = 40
-        except Exception:
-            history_score = 0
-
-    return round(
-        0.30 * component_score
-        + 0.35 * fv_confidence
-        + 0.20 * verify_data
-        + 0.15 * history_score,
-        1
-    )
-
-
-# ============================================================
-# VERIFY STATUS
-# ============================================================
-
-def verify_status(investment, verify, verify_data):
-    if (
-        investment is None
-        or verify is None
-        or verify_data is None
-    ):
-        return "weak"
-
-    if verify_data < 60:
-        return "weak"
-
-    gap = investment - verify
-
-    if abs(gap) <= 10:
-        return "green"
-
-    if abs(gap) <= 20:
-        return "yellow"
-
-    return "red"
-
-
-# ============================================================
-# COMPLETE ANALYSIS
-# ============================================================
-
-def analyze_ticker(ticker):
-    data = download_ticker(ticker)
-
-    info = data.get("info", {})
-
-    if not info:
-        return {
-            "Ticker": ticker,
-            "Company": ticker,
-            "Price": None,
-            "Investment": None,
-            "Recommendation": "—",
-            "error": data.get("error", "No data")
-        }
-
-    price = get_price(data)
-
-    if price is None:
-        return {
-            "Ticker": ticker,
-            "Company": get_company_name(data, ticker),
-            "Price": None,
-            "Investment": None,
-            "Recommendation": "—",
-            "error": "No price"
-        }
-
-    sector = get_sector(
-        data,
-        ticker
-    )
-
-    # --------------------------------------------------------
-    # Main scores
-    # --------------------------------------------------------
-
-    quality = quality_score(data)
-    future = future_score(data)
-
-    kpax = weighted_score(
-        [
-            (quality, 0.40),
-            (future, 0.60)
-        ]
-    )
-
-    fv = fair_value_model(data)
-
-    fair_value_score = fv[
-        "fair_value_score"
-    ]
-
-    relative = relative_valuation(data)
-
-    kpax_fv = kpax_fv_score(
-        fair_value_score,
-        relative
-    )
-
-    risk = risk_score(data)
-
-    investment = investment_score(
-        kpax,
-        kpax_fv,
-        risk
-    )
-
-    technical = technical_score(data)
-
-    recommendation = base_recommendation(
-        investment
-    )
-
-    recommendation = apply_technical_filter(
-        recommendation,
-        technical
-    )
-
-    # --------------------------------------------------------
-    # Verify
-    # --------------------------------------------------------
-
-    verify = verify_score(data)
-
-    verify_value = verify[
-        "verify"
-    ]
-
-    gap = None
-
-    if (
-        investment is not None
-        and verify_value is not None
-    ):
-        gap = investment - verify_value
-
-    status = verify_status(
-        investment,
-        verify_value,
-        verify["verify_data"]
-    )
-
-    # --------------------------------------------------------
-    # Confidence
-    # --------------------------------------------------------
-
-    confidence = model_confidence(
-        kpax,
-        kpax_fv,
-        risk,
-        fv,
-        verify["verify_data"],
-        data.get("history")
-    )
-
-    # --------------------------------------------------------
-    # Fair Value upside
-    # --------------------------------------------------------
-
-    fair_value = fv["fair_value"]
-
-    upside = None
-
-    if fair_value is not None:
-        upside = (
-            fair_value / price - 1
-        ) * 100
-
-    # --------------------------------------------------------
-    # Return
-    # --------------------------------------------------------
-
-    return {
-        "Ticker": ticker,
-        "Company": get_company_name(
-            data,
-            ticker
-        ),
-        "Sector": sector,
-        "Currency": get_currency(data),
-
-        "Price": price,
-        "Fair Value": fair_value,
-        "FV Upside %": upside,
-
-        "Fair Value Score": fair_value_score,
-        "Relative Valuation": relative,
-
-        "KPAX": kpax,
-        "KPAX-FV": kpax_fv,
-        "Risk": risk,
-        "Technical": technical,
-        "Investment": investment,
-
-        "Recommendation": recommendation,
-
-        "Quality": quality,
-        "Future": future,
-
-        "Earnings FV": fv["earnings_fv"],
-        "FCF FV": fv["fcf_fv"],
-        "Analyst FV": fv["analyst_fv"],
-
-        "Normalized FCF": fv[
-            "normalized_fcf"
-        ],
-        "FCF Years": fv[
-            "fcf_years"
-        ],
-        "FV Models": fv[
-            "model_count"
-        ],
-        "FV Confidence": fv[
-            "model_confidence"
-        ],
-
-        "Model Confidence": confidence,
-
-        "Verify": verify_value,
-        "Verify Gap": gap,
-        "Verify Status": status,
-        "Verify Data": verify[
-            "verify_data"
-        ],
-        "Verify Growth": verify[
-            "verify_growth"
-        ],
-        "Verify Profitability": verify[
-            "verify_profitability"
-        ],
-        "Verify Debt": verify[
-            "verify_debt"
-        ],
-        "Verify Valuation": verify[
-            "verify_valuation"
-        ]
-    }
-
-
-# ============================================================
-# DISPLAY HELPERS
-# ============================================================
-
-def format_score(value):
-    if value is None:
-        return "—"
-
-    return f"{value:.1f}"
-
-
-def format_price(value):
-    if value is None:
-        return "—"
-
-    return f"{value:,.2f}"
-
-
-def format_pct(value):
-    if value is None:
-        return "—"
-
-    return f"{value:+.1f}%"
-
-
-def style_recommendation(value):
-    if value == "Strong Buy":
-        return "🟢 Strong Buy"
-
-    if value == "Buy":
-        return "🟢 Buy"
-
-    if value == "Accumulate":
-        return "🟢 Accumulate"
-
-    if value == "Hold":
-        return "🟡 Hold"
-
-    if value == "Reduce / Watch":
-        return "🟠 Reduce / Watch"
-
-    if value == "Avoid":
-        return "🔴 Avoid"
-
-    return "—"
+
+        component_availability = (
+            sum(
+                x is not None
+                for x in component_values
+            )
+            / len(component_values)
+        ) * 100.0
+
+        confidence = model_confidence(
+            component_availability,
+            fv["model_confidence"],
+            verify_completeness,
+            len(hist)
+        )
+
+        # ----------------------------------------------------
+        # OUTPUT
+        # ----------------------------------------------------
+
+        result.update({
+
+            "Fair Value": fair_value,
+
+            "FV Upside": (
+                (
+                    fair_value / price
+                    - 1
+                ) * 100
+                if (
+                    fair_value is not None
+                    and price > 0
+                )
+                else None
+            ),
+
+            "FV Score": fair_value_score,
+
+            "Relative Valuation": relative_score,
+
+            "KPAX": kpax,
+
+            "KPAX-FV": kpax_fv,
+
+            "Risk": risk,
+
+            "Technical": technical,
+
+            "Investment": investment,
+
+            "Recommendation": rec,
+
+            "Verify": verify,
+
+            "Gap": gap,
+
+            "Status": status,
+
+            "Model Confidence": confidence,
+
+            "Data Quality": quality_data,
+
+            "Revenue": revenue,
+
+            "EPS": trailing_eps,
+
+            "Forward EPS": forward_eps,
+
+            "FCF": normalized_fcf,
+
+            "Equity": equity,
+
+            "Debt": debt,
+
+            "Cash": cash,
+
+            "Growth": growth,
+
+            "Forward PE": forward_pe,
+
+            "Trailing PE": trailing_pe,
+
+            "PEG": peg,
+
+            "P/S": price_sales,
+
+            "P/B": price_book,
+
+            "Analyst Target": analyst_target,
+
+            "FV Models": fv[
+                "model_count"
+            ],
+
+            "FV Availability": kpax_fv_availability,
+
+            "Relative Availability": relative_availability
+        })
+
+        return result
+
+    except Exception as e:
+
+        result["Status"] = (
+            "error"
+        )
+
+        result["Error"] = str(e)
+
+        return result
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("⚙️ Modell")
-
-st.sidebar.subheader(
-    "Investment Score Gewichtung"
+st.sidebar.title(
+    f"📊 Aktien-Screener {VERSION}"
 )
 
-col1, col2, col3 = st.sidebar.columns(3)
+st.sidebar.caption(
+    "Robuste Fundamentaldaten + KPAX + Fair Value"
+)
+
+st.sidebar.subheader(
+    "Investment Score Gewichte"
+)
+
+w_kpax = st.sidebar.number_input(
+    "KPAX",
+    min_value=0.0,
+    max_value=1.0,
+    value=float(
+        st.session_state.score_weights["kpax"]
+    ),
+    step=0.05,
+    format="%.2f"
+)
+
+w_fv = st.sidebar.number_input(
+    "KPAX-FV",
+    min_value=0.0,
+    max_value=1.0,
+    value=float(
+        st.session_state.score_weights["kpax_fv"]
+    ),
+    step=0.05,
+    format="%.2f"
+)
+
+w_risk = st.sidebar.number_input(
+    "Risk",
+    min_value=0.0,
+    max_value=1.0,
+    value=float(
+        st.session_state.score_weights["risk"]
+    ),
+    step=0.05,
+    format="%.2f"
+)
+
+col_a, col_b = st.sidebar.columns(2)
+
+with col_a:
+
+    if st.button(
+        "💾 Anwenden",
+        use_container_width=True
+    ):
+
+        st.session_state.score_weights = {
+            "kpax": w_kpax,
+            "kpax_fv": w_fv,
+            "risk": w_risk
+        }
+
+        st.cache_data.clear()
+
+        st.rerun()
+
+with col_b:
+
+    if st.button(
+        "↩ Reset",
+        use_container_width=True
+    ):
+
+        st.session_state.score_weights = (
+            INITIAL_SCORE_WEIGHTS.copy()
+        )
+
+        st.cache_data.clear()
+
+        st.rerun()
+
+normalized = normalize_weights(
+    st.session_state.score_weights
+)
+
+st.sidebar.caption(
+    "Effektive Gewichte:"
+)
+
+st.sidebar.write(
+    f"KPAX: **{normalized['kpax']*100:.0f}%**"
+)
+
+st.sidebar.write(
+    f"KPAX-FV: **{normalized['kpax_fv']*100:.0f}%**"
+)
+
+st.sidebar.write(
+    f"Risk: **{normalized['risk']*100:.0f}%**"
+)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+st.title(
+    f"📊 Aktien-Screener {VERSION}"
+)
+
+st.markdown(
+    """
+**Datenengine V21:** Fundamentaldaten werden primär aus
+Yahoo-Financial-Statements gelesen. `Ticker.info` dient nur
+noch als Ergänzung/Fallback.
+"""
+)
+
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    kpax_weight = st.number_input(
-        "KPAX %",
-        min_value=0.0,
-        max_value=100.0,
-        value=45.0,
-        step=5.0
+
+    run_button = st.button(
+        "🚀 Screener aktualisieren",
+        type="primary",
+        use_container_width=True
     )
 
 with col2:
-    fv_weight = st.number_input(
-        "KPAX-FV %",
-        min_value=0.0,
-        max_value=100.0,
-        value=45.0,
-        step=5.0
+
+    clear_button = st.button(
+        "🗑 Cache löschen",
+        use_container_width=True
     )
 
 with col3:
-    risk_weight = st.number_input(
-        "Risk %",
-        min_value=0.0,
-        max_value=100.0,
-        value=10.0,
-        step=5.0
+
+    st.metric(
+        "Aktien",
+        len(TICKERS)
     )
 
-st.session_state.score_weights = {
-    "kpax": kpax_weight,
-    "kpax_fv": fv_weight,
-    "risk": risk_weight
-}
 
-st.sidebar.caption(
-    f"Summe: "
-    f"{kpax_weight + fv_weight + risk_weight:.0f}% "
-    "(wird automatisch normalisiert)"
-)
+if clear_button:
 
+    st.cache_data.clear()
 
-st.sidebar.subheader(
-    "KPAX-FV Gewichtung"
-)
-
-fv_part = st.sidebar.number_input(
-    "Fair Value %",
-    min_value=0.0,
-    max_value=100.0,
-    value=55.0,
-    step=5.0
-)
-
-rel_part = st.sidebar.number_input(
-    "Relative Valuation %",
-    min_value=0.0,
-    max_value=100.0,
-    value=45.0,
-    step=5.0
-)
-
-st.session_state.kpax_fv_weights = {
-    "fair_value": fv_part,
-    "relative_valuation": rel_part
-}
-
-
-if st.sidebar.button(
-    "🔄 Reset Gewichte",
-    use_container_width=True
-):
-    st.session_state.score_weights = (
-        INITIAL_SCORE_WEIGHTS.copy()
-    )
-
-    st.session_state.kpax_fv_weights = (
-        INITIAL_KPAX_FV_WEIGHTS.copy()
+    st.success(
+        "Cache wurde gelöscht."
     )
 
     st.rerun()
 
 
 # ============================================================
-# HEADER
+# RUN ANALYSIS
 # ============================================================
 
-st.title(
-    "📊 Aktien-Screener V20.4"
-)
-
-st.caption(
-    "KPAX + robuste Fair-Value-Bewertung + "
-    "Relative Valuation + unabhängiger Verify-Check"
-)
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-run = st.button(
-    "🚀 Screener starten",
-    type="primary",
-    use_container_width=True
-)
-
-
-if run:
-
-    progress = st.progress(0)
+if run_button or "screening_results" not in st.session_state:
 
     results = []
 
-    total = len(TICKERS)
+    progress = st.progress(
+        0
+    )
+
+    status_text = st.empty()
 
     for i, ticker in enumerate(TICKERS):
 
-        try:
-            result = analyze_ticker(
-                ticker
-            )
+        status_text.write(
+            f"Analysiere **{ticker}** ..."
+        )
 
-            results.append(result)
+        result = analyze_ticker(
+            ticker
+        )
 
-        except Exception as e:
-
-            results.append(
-                {
-                    "Ticker": ticker,
-                    "Company": ticker,
-                    "Price": None,
-                    "Investment": None,
-                    "Recommendation": "—",
-                    "error": str(e)
-                }
-            )
+        results.append(
+            result
+        )
 
         progress.progress(
-            int(
-                (i + 1)
-                / total
-                * 100
-            )
+            (i + 1)
+            / len(TICKERS)
         )
 
-        time.sleep(0.03)
+        # Small delay avoids aggressive request bursts
+        time.sleep(
+            0.05
+        )
 
     progress.empty()
+    status_text.empty()
 
-    df = pd.DataFrame(results)
+    st.session_state.screening_results = (
+        results
+    )
 
-    if not df.empty:
 
-        # ----------------------------------------------------
-        # Sort
-        # ----------------------------------------------------
+results = st.session_state.screening_results
 
-        df = df.sort_values(
-            by="Investment",
-            ascending=False,
-            na_position="last"
+df = pd.DataFrame(
+    results
+)
+
+
+# ============================================================
+# SORT
+# ============================================================
+
+if not df.empty:
+
+    df["_sort"] = pd.to_numeric(
+        df["Investment"],
+        errors="coerce"
+    )
+
+    df = df.sort_values(
+        "_sort",
+        ascending=False,
+        na_position="last"
+    )
+
+    df = df.drop(
+        columns=["_sort"]
+    )
+
+
+# ============================================================
+# MAIN TABLE
+# ============================================================
+
+st.subheader(
+    "🏆 Ranking"
+)
+
+display_columns = [
+    "Ticker",
+    "Price",
+    "Fair Value",
+    "FV Upside",
+    "FV Score",
+    "Relative Valuation",
+    "KPAX",
+    "KPAX-FV",
+    "Risk",
+    "Technical",
+    "Investment",
+    "Recommendation",
+    "Verify",
+    "Gap",
+    "Status",
+    "Model Confidence"
+]
+
+display_df = df[
+    display_columns
+].copy()
+
+display_df["Price"] = display_df[
+    "Price"
+].apply(format_price)
+
+display_df["Fair Value"] = display_df[
+    "Fair Value"
+].apply(format_price)
+
+display_df["FV Upside"] = display_df[
+    "FV Upside"
+].apply(format_pct)
+
+for col in [
+    "FV Score",
+    "Relative Valuation",
+    "KPAX",
+    "KPAX-FV",
+    "Risk",
+    "Technical",
+    "Investment",
+    "Verify",
+    "Model Confidence"
+]:
+
+    display_df[col] = display_df[
+        col
+    ].apply(format_score)
+
+display_df["Gap"] = display_df[
+    "Gap"
+].apply(format_number)
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# ============================================================
+# DATA IMPORT DIAGNOSTICS
+# ============================================================
+
+st.subheader(
+    "🔎 Datenimport-Diagnose"
+)
+
+st.caption(
+    "Damit lässt sich direkt erkennen, ob ein Wert wirklich "
+    "von Yahoo fehlt oder erst im Score-Modell verloren geht."
+)
+
+diagnostic_columns = [
+    "Ticker",
+    "Price",
+    "Revenue",
+    "EPS",
+    "Forward EPS",
+    "FCF",
+    "Equity",
+    "Debt",
+    "Cash",
+    "Growth",
+    "Forward PE",
+    "Trailing PE",
+    "PEG",
+    "P/S",
+    "P/B",
+    "Analyst Target",
+    "FV Models",
+    "FV Availability",
+    "Relative Availability",
+    "Data Quality",
+    "History Days",
+    "Status"
+]
+
+diag = df[
+    diagnostic_columns
+].copy()
+
+for col in [
+    "Price",
+    "Revenue",
+    "EPS",
+    "Forward EPS",
+    "FCF",
+    "Equity",
+    "Debt",
+    "Cash",
+    "Analyst Target"
+]:
+
+    diag[col] = diag[col].apply(
+        lambda x: (
+            format_number(x, 2)
+            if safe_float(x) is not None
+            else "—"
         )
+    )
 
-        # ----------------------------------------------------
-        # Main table
-        # ----------------------------------------------------
+for col in [
+    "Growth",
+    "FV Availability",
+    "Relative Availability",
+    "Data Quality"
+]:
 
-        st.subheader(
-            "📈 Investment Ranking"
+    diag[col] = diag[col].apply(
+        lambda x: (
+            format_pct(x)
+            if safe_float(x) is not None
+            else "—"
         )
+    )
 
-        display = df.copy()
+for col in [
+    "Forward PE",
+    "Trailing PE",
+    "PEG",
+    "P/S",
+    "P/B"
+]:
 
-        display["Price"] = display[
-            "Price"
-        ].apply(format_price)
-
-        display["Fair Value"] = display[
-            "Fair Value"
-        ].apply(format_price)
-
-        display["FV Upside %"] = display[
-            "FV Upside %"
-        ].apply(format_pct)
-
-        score_columns = [
-            "Fair Value Score",
-            "Relative Valuation",
-            "KPAX",
-            "KPAX-FV",
-            "Risk",
-            "Technical",
-            "Investment",
-            "Verify",
-            "Verify Gap",
-            "Verify Data",
-            "Model Confidence"
-        ]
-
-        for col in score_columns:
-            if col in display.columns:
-                display[col] = display[
-                    col
-                ].apply(format_score)
-
-        display[
-            "Recommendation"
-        ] = display[
-            "Recommendation"
-        ].apply(
-            style_recommendation
+    diag[col] = diag[col].apply(
+        lambda x: (
+            format_number(x, 2)
+            if safe_float(x) is not None
+            else "—"
         )
+    )
 
-        main_columns = [
-            "Ticker",
-            "Company",
-            "Price",
-            "Fair Value",
-            "FV Upside %",
-            "Fair Value Score",
-            "Relative Valuation",
-            "KPAX",
-            "KPAX-FV",
-            "Risk",
-            "Technical",
-            "Investment",
-            "Recommendation",
-            "Verify",
-            "Verify Gap",
-            "Verify Status",
-            "Model Confidence"
-        ]
+st.dataframe(
+    diag,
+    use_container_width=True,
+    hide_index=True
+)
 
-        main_columns = [
-            c for c in main_columns
-            if c in display.columns
-        ]
 
-        st.dataframe(
-            display[main_columns],
-            use_container_width=True,
-            hide_index=True
-        )
+# ============================================================
+# FAIR VALUE DETAIL
+# ============================================================
 
-        # ----------------------------------------------------
-        # Fair Value diagnostics
-        # ----------------------------------------------------
+st.subheader(
+    "💰 Fair Value Detail"
+)
 
-        st.subheader(
-            "💰 Fair Value Detail"
-        )
+fv_columns = [
+    "Ticker",
+    "Price",
+    "Fair Value",
+    "FV Upside",
+    "FV Score",
+    "FV Models",
+    "FV Availability",
+    "Analyst Target",
+    "Forward EPS",
+    "EPS",
+    "FCF",
+    "Growth"
+]
 
-        fv_display = df.copy()
+fv_df = df[
+    fv_columns
+].copy()
 
-        fv_columns = [
-            "Ticker",
-            "Company",
-            "Price",
-            "Fair Value",
-            "FV Upside %",
-            "Earnings FV",
-            "FCF FV",
-            "Analyst FV",
-            "Normalized FCF",
-            "FCF Years",
-            "FV Models",
-            "FV Confidence"
-        ]
+fv_df["Price"] = fv_df[
+    "Price"
+].apply(format_price)
 
-        fv_columns = [
-            c for c in fv_columns
-            if c in fv_display.columns
-        ]
+fv_df["Fair Value"] = fv_df[
+    "Fair Value"
+].apply(format_price)
 
-        st.dataframe(
-            fv_display[fv_columns],
-            use_container_width=True,
-            hide_index=True
-        )
+fv_df["FV Upside"] = fv_df[
+    "FV Upside"
+].apply(format_pct)
 
-        st.caption(
-            "V20.4: FCF wird aus bis zu drei "
-            "Geschäftsjahren normalisiert. Einzelne "
-            "extreme FCF-Spitzen dominieren den Fair Value "
-            "damit nicht mehr."
-        )
+fv_df["FV Score"] = fv_df[
+    "FV Score"
+].apply(format_score)
 
-        # ----------------------------------------------------
-        # Verify
-        # ----------------------------------------------------
+fv_df["FV Availability"] = fv_df[
+    "FV Availability"
+].apply(format_pct)
 
-        st.subheader(
-            "🔎 Independent Verify"
-        )
+fv_df["Analyst Target"] = fv_df[
+    "Analyst Target"
+].apply(format_price)
 
-        verify_display = df.copy()
+fv_df["Forward EPS"] = fv_df[
+    "Forward EPS"
+].apply(format_number)
 
-        verify_columns = [
-            "Ticker",
-            "Investment",
-            "Verify",
-            "Verify Gap",
-            "Verify Status",
-            "Verify Data",
-            "Verify Growth",
-            "Verify Profitability",
-            "Verify Debt",
-            "Verify Valuation"
-        ]
+fv_df["EPS"] = fv_df[
+    "EPS"
+].apply(format_number)
 
-        verify_columns = [
-            c for c in verify_columns
-            if c in verify_display.columns
-        ]
+fv_df["FCF"] = fv_df[
+    "FCF"
+].apply(format_number)
 
-        for col in verify_columns:
-            if col not in [
-                "Ticker",
-                "Verify Status"
-            ]:
-                verify_display[col] = (
-                    verify_display[col]
-                    .apply(format_score)
-                )
+fv_df["Growth"] = fv_df[
+    "Growth"
+].apply(format_pct)
 
-        st.dataframe(
-            verify_display[
-                verify_columns
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
+st.dataframe(
+    fv_df,
+    use_container_width=True,
+    hide_index=True
+)
 
-        # ----------------------------------------------------
-        # Formula section
-        # ----------------------------------------------------
 
-        st.subheader(
-            "🧮 Mathematik des Modells"
-        )
+# ============================================================
+# VERIFY
+# ============================================================
 
-        st.markdown(
-            """
-### 1. KPAX
+st.subheader(
+    "🧪 Verify"
+)
 
-**KPAX = 40 % Quality + 60 % Future**
+verify_columns = [
+    "Ticker",
+    "Investment",
+    "Verify",
+    "Gap",
+    "Status",
+    "Model Confidence",
+    "Data Quality"
+]
 
----
+verify_df = df[
+    verify_columns
+].copy()
 
-### 2. Quality
+verify_df["Investment"] = verify_df[
+    "Investment"
+].apply(format_score)
 
-Nicht-finanzielle Unternehmen:
+verify_df["Verify"] = verify_df[
+    "Verify"
+].apply(format_score)
 
-**Quality = 30 % ROIC + 15 % Gross Margin + 20 % FCF Margin + 20 % Earnings Growth + 15 % Revenue Growth**
+verify_df["Gap"] = verify_df[
+    "Gap"
+].apply(format_number)
+
+verify_df["Model Confidence"] = verify_df[
+    "Model Confidence"
+].apply(format_score)
+
+verify_df["Data Quality"] = verify_df[
+    "Data Quality"
+].apply(format_pct)
+
+st.dataframe(
+    verify_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# ============================================================
+# FORMULAS
+# ============================================================
+
+st.subheader(
+    "🧮 Mathematik des Modells"
+)
+
+with st.expander(
+    "Berechnungsformeln anzeigen"
+):
+
+    st.markdown(
+        """
+### 1. Quality Score
+
+Nicht-Finanzunternehmen:
+
+`Quality = 30% ROIC + 15% Gross Margin + 20% FCF Margin + 20% Earnings Growth + 15% Revenue Growth`
 
 Finanzunternehmen:
 
-**Quality = 40 % ROE + 30 % Net Margin + 20 % Earnings Growth + 10 % Revenue Growth**
-
-Fehlende Komponenten werden automatisch herausgerechnet und die vorhandenen Gewichte normalisiert.
+`Quality = 40% ROE + 30% Net Margin + 20% Earnings Growth + 10% Revenue Growth`
 
 ---
 
-### 3. Future
+### 2. Future Score
 
-**Future = 25 % historische Earnings Growth + 20 % Revenue Growth + 20 % Forward Earnings Growth + 15 % Long-Term Growth + 10 % FCF Margin + 10 % Growth Acceleration**
+`Future = 35% Earnings Growth + 20% Revenue Growth + 20% FCF Margin + 25% Analyst Upside`
 
-Dabei:
-
-**Growth Acceleration = Forward Earnings Growth − historische Earnings Growth**
+Nicht verfügbare Komponenten werden innerhalb dieses Submodells
+nicht als 0 bewertet.
 
 ---
 
-### 4. Fair Value
+### 3. KPAX
 
-#### Earnings Fair Value
+`KPAX = 40% Quality + 60% Future`
 
-**Fair P/E = 12 + 0,25 × Growth**
+---
+
+### 4. Earnings Fair Value
+
+`Fair P/E = 12 + 0.25 × Growth`
 
 begrenzt auf:
 
-**12 ≤ Fair P/E ≤ 24**
+`12 ≤ Fair P/E ≤ 24`
 
-Dann:
+Danach:
 
-**Earnings FV = Forward EPS × Fair P/E**
+`Earnings FV = EPS × Fair P/E`
 
----
-
-#### Normalized FCF Fair Value
-
-Der FCF wird nicht mehr aus einem einzelnen Spitzenjahr verwendet.
-
-Es werden bis zu drei Jahre betrachtet:
-
-**Normalized FCF = Median der positiven Jahres-FCFs**
-
-Dann:
-
-**FCF/share = Normalized FCF / Shares Outstanding**
-
-und:
-
-**FCF FV = FCF/share / Target Yield**
-
-Die Target Yield wird abhängig vom Wachstum angepasst und zusätzlich bei hohem Beta erhöht.
+Primär wird Forward EPS verwendet.
+Falls dieses fehlt, wird Trailing EPS verwendet.
 
 ---
 
-#### Analyst Fair Value
+### 5. FCF Fair Value
 
-**Analyst FV = Median aus verfügbarem Analyst Mean/Median Target**
+`FCF/share = normalisierter FCF / Aktienanzahl`
+
+`Target Yield = 7.0% − 0.08 × Growth`
+
+Danach Begrenzung auf:
+
+`4.5% ≤ Target Yield ≤ 9.0%`
+
+Bei Beta > 1 wird ein zusätzlicher Risikoaufschlag vorgenommen.
 
 ---
 
-#### Gesamt-Fair-Value
+### 6. Fair Value
 
-Nicht-finanziell:
+Nicht-Finanzunternehmen:
 
-**FV = 45 % Earnings FV + 25 % FCF FV + 30 % Analyst FV**
+`45% Earnings FV + 25% FCF FV + 30% Analyst FV`
 
 Finanzunternehmen:
 
-**FV = 35 % Earnings FV + 15 % FCF FV + 50 % Analyst FV**
+`35% Earnings FV + 15% FCF FV + 50% Analyst FV`
 
-Extreme Einzelmodelle werden vorher begrenzt.
-
-Zusätzlich:
-
-**0,40 × Kurs ≤ Fair Value ≤ 2,50 × Kurs**
+Nicht verfügbare Modelle werden nicht als 0 bewertet.
 
 ---
 
-### 5. Fair Value Score
+### 7. Fair Value Score
 
-**Fair Value Score = 55 + 0,60 × Upside %**
+`FV Score = 55 + 0.60 × FV Upside`
 
-anschließend:
+begrenzt auf:
 
-**5 ≤ Score ≤ 100**
+`5 ≤ FV Score ≤ 100`
 
 ---
 
-### 6. Relative Valuation
+### 8. Relative Valuation
 
-Nicht-finanzielle Unternehmen:
+Nicht-Finanzunternehmen:
 
-**35 % Forward P/E + 10 % Trailing P/E + 30 % PEG + 25 % P/S**
+`35% Forward PE + 10% Trailing PE + 30% PEG + 25% P/S`
 
 Finanzunternehmen:
 
-**35 % Forward P/E + 15 % Trailing P/E + 15 % PEG + 35 % P/B**
+`35% Forward PE + 15% Trailing PE + 15% PEG + 35% P/B`
 
-Die einzelnen Bewertungskennzahlen werden über eine stabile Sigmoid-Funktion in Scores von 5–100 umgerechnet.
-
----
-
-### 7. KPAX-FV
-
-**KPAX-FV = 55 % Fair Value Score + 45 % Relative Valuation**
+Die Einzelkennzahlen werden über eine Sigmoid-Funktion in einen
+0–100 Score umgerechnet.
 
 ---
 
-### 8. Risk
+### 9. KPAX-FV
 
-**Risk = 45 % Financial/Stability + 35 % Market Risk + 20 % Stability**
-
-Market Risk berücksichtigt insbesondere:
-
-- annualisierte Volatilität
-- Maximum Drawdown
-- Beta als Fallback
+`KPAX-FV = 55% Fair Value Score + 45% Relative Valuation`
 
 ---
 
-### 9. Investment Score
+### 10. Investment Score
 
 Standard:
 
-**Investment = 45 % KPAX + 45 % KPAX-FV + 10 % Risk**
+`45% KPAX + 45% KPAX-FV + 10% Risk`
 
-Die Gewichte können oben links verändert werden.
+**Wichtig:** Fehlt der komplette KPAX-FV-Block, wird er nicht aus
+der Gewichtung entfernt. Stattdessen wird für diesen Block neutral
+`50` angesetzt.
 
----
-
-### 10. Technical
-
-Technical ist **nicht Bestandteil des Investment Scores**.
-
-Er dient ausschließlich als Timing-/Recommendation-Filter.
-
-Dadurch kann beispielsweise ein fundamental starker Titel mit schwachem Chart maximal auf „Hold“ reduziert werden.
+Dadurch kann eine Aktie mit fehlender Bewertung nicht mehr
+fälschlicherweise durch eine Renormalisierung zum Strong Buy werden.
 
 ---
 
 ### 11. Recommendation
 
-- **≥ 85:** Strong Buy
-- **≥ 80:** Buy
-- **≥ 75:** Accumulate
-- **≥ 68:** Hold
-- **≥ 55:** Reduce / Watch
-- **< 55:** Avoid
+- `≥ 85` Strong Buy
+- `≥ 80` Buy
+- `≥ 75` Accumulate
+- `≥ 68` Hold
+- `≥ 55` Reduce / Watch
+- `< 55` Avoid
 
-Der Technical Score kann die maximale Empfehlung begrenzen.
-            """
+Technical wirkt zusätzlich als Timing-Filter.
+
+Eine Aktie ohne vollständige Bewertungsdaten kann nicht als
+Strong Buy ausgegeben werden.
+"""
+    )
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+st.subheader(
+    "📌 Kurzdiagnose"
+)
+
+if not df.empty:
+
+    total = len(df)
+
+    with_fv = df[
+        df["Fair Value"].apply(
+            lambda x: safe_float(x) is not None
+        )
+    ].shape[0]
+
+    with_relative = df[
+        df["Relative Valuation"].apply(
+            lambda x: safe_float(x) is not None
+        )
+    ].shape[0]
+
+    with_kpax = df[
+        df["KPAX"].apply(
+            lambda x: safe_float(x) is not None
+        )
+    ].shape[0]
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric(
+            "Aktien analysiert",
+            total
         )
 
-        # ----------------------------------------------------
-        # Diagnostics
-        # ----------------------------------------------------
-
-        st.subheader(
-            "🛠️ Daten- & Modell-Diagnose"
+    with col2:
+        st.metric(
+            "Fair Value verfügbar",
+            f"{with_fv}/{total}"
         )
 
-        diagnostic_columns = [
-            "Ticker",
-            "Company",
-            "Currency",
-            "Sector",
-            "FCF Years",
-            "FV Models",
-            "FV Confidence",
-            "Model Confidence"
-        ]
-
-        diagnostic_columns = [
-            c for c in diagnostic_columns
-            if c in df.columns
-        ]
-
-        st.dataframe(
-            df[diagnostic_columns],
-            use_container_width=True,
-            hide_index=True
+    with col3:
+        st.metric(
+            "Relative Valuation",
+            f"{with_relative}/{total}"
         )
 
-        st.caption(
-            "Interpretation: „—“ bedeutet weiterhin "
-            "Daten fehlen. Ein Score von 5 ist dagegen "
-            "ein tatsächlich berechneter sehr schlechter Score."
+    with col4:
+        st.metric(
+            "KPAX",
+            f"{with_kpax}/{total}"
         )
 
-        # ----------------------------------------------------
-        # Sanity warnings
-        # ----------------------------------------------------
+    if with_fv < total * 0.7:
 
-        warnings = []
-
-        for _, row in df.iterrows():
-
-            ticker = row.get(
-                "Ticker",
-                ""
-            )
-
-            fair_value = safe_float(
-                row.get("Fair Value")
-            )
-
-            price = safe_float(
-                row.get("Price")
-            )
-
-            confidence = safe_float(
-                row.get("Model Confidence")
-            )
-
-            if (
-                fair_value is not None
-                and price is not None
-                and price > 0
-            ):
-                ratio = fair_value / price
-
-                if ratio >= 2.45:
-                    warnings.append(
-                        f"{ticker}: Fair Value nahe am "
-                        f"2,5×-Cap ({ratio:.2f}×)"
-                    )
-
-            if (
-                confidence is not None
-                and confidence < 50
-            ):
-                warnings.append(
-                    f"{ticker}: niedrige Model Confidence "
-                    f"({confidence:.0f})"
-                )
-
-        if warnings:
-
-            st.subheader(
-                "⚠️ Modell-Hinweise"
-            )
-
-            for warning in warnings:
-                st.warning(warning)
-
-        # ----------------------------------------------------
-        # Summary metrics
-        # ----------------------------------------------------
-
-        st.subheader(
-            "📊 Zusammenfassung"
+        st.warning(
+            "⚠️ Bei einem großen Teil der Aktien fehlen weiterhin "
+            "Fair-Value-Daten. Die Diagnose-Tabelle oben zeigt "
+            "jetzt, ob EPS/FCF/Analyst Target bzw. andere "
+            "Fundamentaldaten bereits beim Yahoo-Import fehlen."
         )
 
-        valid_investments = (
-            df["Investment"]
-            .dropna()
+    else:
+
+        st.success(
+            "✅ Der Fundamentaldaten-Import liefert für den "
+            "Großteil des Universums verwertbare Daten."
         )
 
-        if len(valid_investments) > 0:
 
-            c1, c2, c3, c4 = st.columns(4)
+# ============================================================
+# FOOTER
+# ============================================================
 
-            with c1:
-                st.metric(
-                    "Analysierte Titel",
-                    len(df)
-                )
-
-            with c2:
-                st.metric(
-                    "Valide Scores",
-                    len(valid_investments)
-                )
-
-            with c3:
-                st.metric(
-                    "Ø Investment Score",
-                    f"{valid_investments.mean():.1f}"
-                )
-
-            with c4:
-                strong = sum(
-                    df["Recommendation"]
-                    == "Strong Buy"
-                )
-
-                st.metric(
-                    "Strong Buy",
-                    strong
-                )
+st.caption(
+    f"Aktien-Screener {VERSION} | "
+    "Yahoo Finance / yfinance | "
+    "Scores sind Modellwerte und keine Anlageberatung."
+)
